@@ -1,0 +1,30 @@
+# Video Matting Configuration
+#
+# Setup instructions:
+# 1. Copy this file: cp config.yaml.example config.yaml
+# 2. Clone required model repos and update paths below
+# 3. Download model weights to: ComfyUI/models/video_matting/<model_name>/
+
+# HuggingFace token (required for gated models like RMBG-2.0)
+# Get your token at: https://huggingface.co/settings/tokens
+huggingface_token: your_token_here
+
+# Model repository paths (required for importing model code)
+# Clone these repos:
+#   git clone https://github.com/PeterL1n/RobustVideoMatting
+#   git clone https://github.com/ZHKKKe/MODNet
+#   git clone https://github.com/xuebinqin/U-2-Net
+#   git clone https://github.com/hkchengrex/Cutie
+#   git clone https://github.com/hustvl/ViTMatte
+
+model_repos:
+  rvm:
+    path: /path/to/RobustVideoMatting
+  modnet:
+    path: /path/to/MODNet
+  u2net:
+    path: /path/to/U-2-Net
+  cutie:
+    path: /path/to/Cutie
+  vitmatte:
+    path: /path/to/ViTMatte
