@@ -115,6 +115,8 @@ class RMBGLoader:
 class RMBGInference:
     """RMBG-2.0 inference node with batch support"""
 
+    PRECISION_MODES = ["fp32", "fp16", "bf16"]
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -137,6 +139,10 @@ class RMBGInference:
                     "step": 1,
                     "tooltip": "Batch size for inference (higher = faster but more VRAM)"
                 }),
+                "precision": (PRECISION_MODES, {
+                    "default": "fp16",
+                    "tooltip": "fp16/bf16 = 2x faster, half VRAM. bf16 better precision."
+                }),
             }
         }
 
@@ -145,7 +151,7 @@ class RMBGInference:
     FUNCTION = "process"
     CATEGORY = "Video Matting/Inference"
 
-    def process(self, rmbg_model, images, process_size=1024, batch_size=4):
+    def process(self, rmbg_model, images, process_size=1024, batch_size=4, precision="fp16"):
         """Process batch of images through RMBG-2.0 with batch inference
 
         Args:
@@ -153,34 +159,41 @@ class RMBGInference:
             images: [B, H, W, C] tensor (ComfyUI IMAGE format, 0-1 float, RGB)
             process_size: resolution for processing
             batch_size: number of frames to process at once
+            precision: fp32, fp16, or bf16
 
         Returns:
             alpha: [B, H, W] tensor (0-1 float)
         """
         model = rmbg_model["model"]
         device = rmbg_model["device"]
-        transform = rmbg_model["transform"]
 
         b, h, w, c = images.shape
         num_batches = (b + batch_size - 1) // batch_size
 
+        # Determine dtype based on precision
+        if precision == "fp16" and device.type in ("cuda", "mps"):
+            dtype = torch.float16
+        elif precision == "bf16" and device.type == "cuda":
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float32
+
         pbar = comfy.utils.ProgressBar(num_batches)
         all_alphas = []
 
-        # Precompute normalization mean/std on device
-        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        # Precompute normalization mean/std on device with target dtype
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
 
-        with torch.no_grad():
-            for batch_idx in tqdm(range(num_batches), desc='RMBG'):
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+            for batch_idx in tqdm(range(num_batches), desc=f'RMBG({precision})'):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, b)
                 batch_frames = images[start_idx:end_idx]  # [batch, H, W, C]
-                current_batch_size = batch_frames.shape[0]
 
                 # Batch preprocessing on GPU
                 # [batch, H, W, C] -> [batch, C, H, W]
-                batch_tensor = batch_frames.permute(0, 3, 1, 2).to(device)
+                batch_tensor = batch_frames.permute(0, 3, 1, 2).to(device=device, dtype=dtype)
 
                 # Resize on GPU using interpolate
                 batch_resized = torch.nn.functional.interpolate(
@@ -204,8 +217,8 @@ class RMBGInference:
                     align_corners=False
                 )  # [batch, 1, H, W]
 
-                # Remove channel dim and move to CPU
-                batch_alphas = pred_resized.squeeze(1).cpu()  # [batch, H, W]
+                # Remove channel dim and move to CPU as float32
+                batch_alphas = pred_resized.squeeze(1).float().cpu()  # [batch, H, W]
                 all_alphas.append(batch_alphas)
 
                 pbar.update(1)
