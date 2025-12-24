@@ -113,7 +113,7 @@ class RMBGLoader:
 
 
 class RMBGInference:
-    """RMBG-2.0 inference node"""
+    """RMBG-2.0 inference node with batch support"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -130,6 +130,13 @@ class RMBGInference:
                     "step": 64,
                     "tooltip": "Processing resolution (model trained on 1024)"
                 }),
+                "batch_size": ("INT", {
+                    "default": 4,
+                    "min": 1,
+                    "max": 32,
+                    "step": 1,
+                    "tooltip": "Batch size for inference (higher = faster but more VRAM)"
+                }),
             }
         }
 
@@ -138,13 +145,14 @@ class RMBGInference:
     FUNCTION = "process"
     CATEGORY = "Video Matting/Inference"
 
-    def process(self, rmbg_model, images, process_size=1024):
-        """Process batch of images through RMBG-2.0
+    def process(self, rmbg_model, images, process_size=1024, batch_size=4):
+        """Process batch of images through RMBG-2.0 with batch inference
 
         Args:
             rmbg_model: RMBG_MODEL dict
             images: [B, H, W, C] tensor (ComfyUI IMAGE format, 0-1 float, RGB)
             process_size: resolution for processing
+            batch_size: number of frames to process at once
 
         Returns:
             alpha: [B, H, W] tensor (0-1 float)
@@ -154,37 +162,54 @@ class RMBGInference:
         transform = rmbg_model["transform"]
 
         b, h, w, c = images.shape
-        alphas = []
+        num_batches = (b + batch_size - 1) // batch_size
 
-        pbar = comfy.utils.ProgressBar(b)
+        pbar = comfy.utils.ProgressBar(num_batches)
+        all_alphas = []
+
+        # Precompute normalization mean/std on device
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
         with torch.no_grad():
-            for i in tqdm(range(b), desc='RMBG'):
-                # Get single frame [H, W, C] -> PIL
-                frame = images[i].cpu().numpy()
-                frame_uint8 = (frame * 255).astype(np.uint8)
-                pil_image = Image.fromarray(frame_uint8)
+            for batch_idx in tqdm(range(num_batches), desc='RMBG'):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, b)
+                batch_frames = images[start_idx:end_idx]  # [batch, H, W, C]
+                current_batch_size = batch_frames.shape[0]
 
-                # Resize for processing
-                orig_size = pil_image.size  # (W, H)
-                resized = pil_image.resize((process_size, process_size), Image.BILINEAR)
+                # Batch preprocessing on GPU
+                # [batch, H, W, C] -> [batch, C, H, W]
+                batch_tensor = batch_frames.permute(0, 3, 1, 2).to(device)
 
-                # To tensor and normalize
-                tensor = transforms.ToTensor()(resized)  # [3, H, W]
-                tensor = transform(tensor)  # normalize
-                tensor = tensor.unsqueeze(0).to(device)  # [1, 3, H, W]
+                # Resize on GPU using interpolate
+                batch_resized = torch.nn.functional.interpolate(
+                    batch_tensor,
+                    size=(process_size, process_size),
+                    mode='bilinear',
+                    align_corners=False
+                )
 
-                # Inference
-                pred = model(tensor)[-1].sigmoid().cpu()  # [1, 1, H, W]
-                pred = pred[0, 0]  # [H, W]
+                # Normalize on GPU
+                batch_normalized = (batch_resized - mean) / std
 
-                # Resize back to original
-                pred_pil = transforms.ToPILImage()(pred)
-                pred_resized = pred_pil.resize(orig_size, Image.BILINEAR)
-                alpha = np.array(pred_resized).astype(np.float32) / 255.0
+                # Batch inference
+                pred = model(batch_normalized)[-1].sigmoid()  # [batch, 1, H, W]
 
-                alphas.append(alpha)
+                # Resize back to original on GPU
+                pred_resized = torch.nn.functional.interpolate(
+                    pred,
+                    size=(h, w),
+                    mode='bilinear',
+                    align_corners=False
+                )  # [batch, 1, H, W]
+
+                # Remove channel dim and move to CPU
+                batch_alphas = pred_resized.squeeze(1).cpu()  # [batch, H, W]
+                all_alphas.append(batch_alphas)
+
                 pbar.update(1)
 
-        alpha_tensor = torch.from_numpy(np.stack(alphas, axis=0)).float()
+        # Concatenate all batches
+        alpha_tensor = torch.cat(all_alphas, dim=0).float()  # [B, H, W]
         return (alpha_tensor,)
