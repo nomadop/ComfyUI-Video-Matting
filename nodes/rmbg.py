@@ -83,7 +83,7 @@ class RMBGLoader:
                 }),
             },
             "optional": {
-                "quantization": (QUANTIZATION_MODES, {
+                "quantization": (cls.QUANTIZATION_MODES, {
                     "default": "none",
                     "tooltip": "fp8 = 4x faster on RTX 4090/5090 (requires torchao)"
                 }),
@@ -186,7 +186,7 @@ class RMBGInference:
                     "step": 1,
                     "tooltip": "Batch size for inference (higher = faster but more VRAM)"
                 }),
-                "precision": (PRECISION_MODES, {
+                "precision": (cls.PRECISION_MODES, {
                     "default": "fp16",
                     "tooltip": "fp16/bf16 = 2x faster, half VRAM. bf16 better precision."
                 }),
