@@ -23,8 +23,9 @@ if os.path.exists(config_path):
     with open(config_path, 'r') as f:
         CONFIG = yaml.safe_load(f) or {}
 
-# Lazy import for optional dependency
+# Lazy import for optional dependencies
 _rmbg_available = None
+_torchao_available = None
 
 
 def check_rmbg_available():
@@ -37,6 +38,18 @@ def check_rmbg_available():
         except ImportError:
             _rmbg_available = False
     return _rmbg_available
+
+
+def check_torchao_available():
+    """Check if torchao is available for FP8 quantization"""
+    global _torchao_available
+    if _torchao_available is None:
+        try:
+            from torchao.quantization import quantize_, float8_dynamic_activation_float8_weight
+            _torchao_available = True
+        except ImportError:
+            _torchao_available = False
+    return _torchao_available
 
 
 def get_hf_token():
@@ -58,6 +71,8 @@ def get_device():
 class RMBGLoader:
     """RMBG-2.0 model loader (downloads from HuggingFace)"""
 
+    QUANTIZATION_MODES = ["none", "fp8"]
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -65,6 +80,16 @@ class RMBGLoader:
                 "model_id": ("STRING", {
                     "default": "briaai/RMBG-2.0",
                     "tooltip": "HuggingFace model ID"
+                }),
+            },
+            "optional": {
+                "quantization": (QUANTIZATION_MODES, {
+                    "default": "none",
+                    "tooltip": "fp8 = 4x faster on RTX 4090/5090 (requires torchao)"
+                }),
+                "compile_model": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use torch.compile for extra speed (slower first run)"
                 }),
             }
         }
@@ -74,7 +99,7 @@ class RMBGLoader:
     FUNCTION = "load_model"
     CATEGORY = "Video Matting/Loaders"
 
-    def load_model(self, model_id):
+    def load_model(self, model_id, quantization="none", compile_model=False):
         if not check_rmbg_available():
             raise ImportError(
                 "RMBG-2.0 requires transformers. "
@@ -99,6 +124,27 @@ class RMBGLoader:
         model.eval()
         model.to(device)
 
+        # Apply FP8 quantization if requested
+        if quantization == "fp8":
+            if not check_torchao_available():
+                raise ImportError(
+                    "FP8 quantization requires torchao. "
+                    "Install with: pip install torchao"
+                )
+            if device.type != "cuda":
+                raise ValueError("FP8 quantization only supported on CUDA devices")
+
+            from torchao.quantization import quantize_, float8_dynamic_activation_float8_weight
+            print(f"[RMBG] Applying FP8 quantization...")
+            quantize_(model, float8_dynamic_activation_float8_weight())
+            print(f"[RMBG] FP8 quantization complete")
+
+        # Optionally compile model
+        if compile_model and device.type == "cuda":
+            print(f"[RMBG] Compiling model with torch.compile...")
+            model = torch.compile(model, mode="reduce-overhead")
+            print(f"[RMBG] Model compilation complete")
+
         # Standard normalization for RMBG
         transform = transforms.Compose([
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -109,6 +155,7 @@ class RMBGLoader:
             "device": device,
             "transform": transform,
             "model_id": model_id,
+            "quantization": quantization,
         },)
 
 
@@ -166,62 +213,78 @@ class RMBGInference:
         """
         model = rmbg_model["model"]
         device = rmbg_model["device"]
+        quantization = rmbg_model.get("quantization", "none")
 
         b, h, w, c = images.shape
         num_batches = (b + batch_size - 1) // batch_size
 
-        # Determine dtype based on precision
-        if precision == "fp16" and device.type in ("cuda", "mps"):
+        # For FP8 quantized models, use fp32 input (quantization handles the rest)
+        # For non-quantized models, use specified precision
+        if quantization == "fp8":
+            dtype = torch.float32
+            use_autocast = False
+            precision_label = "fp8"
+        elif precision == "fp16" and device.type in ("cuda", "mps"):
             dtype = torch.float16
+            use_autocast = True
+            precision_label = "fp16"
         elif precision == "bf16" and device.type == "cuda":
             dtype = torch.bfloat16
+            use_autocast = True
+            precision_label = "bf16"
         else:
             dtype = torch.float32
+            use_autocast = False
+            precision_label = "fp32"
 
         pbar = comfy.utils.ProgressBar(num_batches)
         all_alphas = []
 
-        # Precompute normalization mean/std on device with target dtype
+        # Precompute normalization mean/std on device
         mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
 
-        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-            for batch_idx in tqdm(range(num_batches), desc=f'RMBG({precision})'):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, b)
-                batch_frames = images[start_idx:end_idx]  # [batch, H, W, C]
+        with torch.no_grad():
+            # Use autocast only for fp16/bf16, not for fp8 (already quantized)
+            autocast_ctx = torch.autocast(device_type=device.type, dtype=dtype) if use_autocast else torch.inference_mode()
 
-                # Batch preprocessing on GPU
-                # [batch, H, W, C] -> [batch, C, H, W]
-                batch_tensor = batch_frames.permute(0, 3, 1, 2).to(device=device, dtype=dtype)
+            with autocast_ctx:
+                for batch_idx in tqdm(range(num_batches), desc=f'RMBG({precision_label})'):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, b)
+                    batch_frames = images[start_idx:end_idx]  # [batch, H, W, C]
 
-                # Resize on GPU using interpolate
-                batch_resized = torch.nn.functional.interpolate(
-                    batch_tensor,
-                    size=(process_size, process_size),
-                    mode='bilinear',
-                    align_corners=False
-                )
+                    # Batch preprocessing on GPU
+                    # [batch, H, W, C] -> [batch, C, H, W]
+                    batch_tensor = batch_frames.permute(0, 3, 1, 2).to(device=device, dtype=dtype)
 
-                # Normalize on GPU
-                batch_normalized = (batch_resized - mean) / std
+                    # Resize on GPU using interpolate
+                    batch_resized = torch.nn.functional.interpolate(
+                        batch_tensor,
+                        size=(process_size, process_size),
+                        mode='bilinear',
+                        align_corners=False
+                    )
 
-                # Batch inference
-                pred = model(batch_normalized)[-1].sigmoid()  # [batch, 1, H, W]
+                    # Normalize on GPU
+                    batch_normalized = (batch_resized - mean) / std
 
-                # Resize back to original on GPU
-                pred_resized = torch.nn.functional.interpolate(
-                    pred,
-                    size=(h, w),
-                    mode='bilinear',
-                    align_corners=False
-                )  # [batch, 1, H, W]
+                    # Batch inference
+                    pred = model(batch_normalized)[-1].sigmoid()  # [batch, 1, H, W]
 
-                # Remove channel dim and move to CPU as float32
-                batch_alphas = pred_resized.squeeze(1).float().cpu()  # [batch, H, W]
-                all_alphas.append(batch_alphas)
+                    # Resize back to original on GPU
+                    pred_resized = torch.nn.functional.interpolate(
+                        pred,
+                        size=(h, w),
+                        mode='bilinear',
+                        align_corners=False
+                    )  # [batch, 1, H, W]
 
-                pbar.update(1)
+                    # Remove channel dim and move to CPU as float32
+                    batch_alphas = pred_resized.squeeze(1).float().cpu()  # [batch, H, W]
+                    all_alphas.append(batch_alphas)
+
+                    pbar.update(1)
 
         # Concatenate all batches
         alpha_tensor = torch.cat(all_alphas, dim=0).float()  # [B, H, W]
