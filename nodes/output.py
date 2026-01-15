@@ -4,10 +4,13 @@ Output Nodes
 - ApplyAlpha: Apply alpha to images for final output
 - FrameSelector: Select single frame from batch for efficient preview
 - PreviewSlider: Preview sequence with slider (no re-run needed)
+- ImageSequencePackager: Pack image sequence to ZIP for download
 """
 
 import os
 import random
+import zipfile
+import time
 import torch
 import numpy as np
 from PIL import Image
@@ -239,3 +242,115 @@ class PreviewSlider:
 
         # Return only frames for slider (no images to avoid default preview)
         return {"ui": {"frames": frames}}
+
+
+class ImageSequencePackager:
+    """Pack image sequence to ZIP file for download
+
+    Saves all frames to a ZIP file in the output directory.
+    Returns download URL accessible via ComfyUI web server.
+    """
+
+    FORMAT_OPTIONS = ["png", "jpg", "webp"]
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "sequence"}),
+                "format": (cls.FORMAT_OPTIONS, {"default": "png"}),
+            },
+            "optional": {
+                "quality": ("INT", {"default": 95, "min": 1, "max": 100, "step": 1, "tooltip": "Quality for JPG/WebP (1-100)"}),
+                "server_address": ("STRING", {"default": "http://localhost:8188", "tooltip": "ComfyUI server address for download URL"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("zip_path", "download_url")
+    FUNCTION = "pack"
+    OUTPUT_NODE = True
+    CATEGORY = "Video Matting/Output"
+
+    def pack(self, images, filename_prefix, format, quality=95, server_address="http://localhost:8188"):
+        """Pack image sequence to ZIP
+
+        Args:
+            images: [B, H, W, C] tensor (ComfyUI IMAGE format)
+            filename_prefix: prefix for ZIP filename
+            format: image format (png/jpg/webp)
+            quality: quality for lossy formats
+            server_address: ComfyUI server address for full download URL
+
+        Returns:
+            zip_path: absolute path to ZIP file
+            download_url: full URL for downloading via ComfyUI server
+        """
+        from tqdm import tqdm
+
+        b, h, w, c = images.shape
+
+        # Generate unique filename with timestamp
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        zip_filename = f"{filename_prefix}_{timestamp}.zip"
+        zip_path = os.path.join(self.output_dir, zip_filename)
+
+        # Create ZIP file
+        print(f"Packing {b} frames to {zip_filename}...")
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i in tqdm(range(b), desc="Packing"):
+                frame = images[i].cpu().numpy()
+
+                # Convert to PIL Image
+                if c == 4:
+                    # RGBA
+                    img_array = np.clip(frame * 255, 0, 255).astype(np.uint8)
+                    img = Image.fromarray(img_array, mode='RGBA')
+                else:
+                    # RGB
+                    img_array = np.clip(frame * 255, 0, 255).astype(np.uint8)
+                    img = Image.fromarray(img_array, mode='RGB')
+
+                # Determine frame filename (pure numbers, no prefix)
+                frame_filename = f"{i:05d}.{format}"
+
+                # Save to bytes buffer
+                from io import BytesIO
+                buffer = BytesIO()
+
+                if format == "png":
+                    img.save(buffer, format="PNG", compress_level=6)
+                elif format == "jpg":
+                    if c == 4:
+                        img = img.convert('RGB')
+                    img.save(buffer, format="JPEG", quality=quality)
+                elif format == "webp":
+                    img.save(buffer, format="WEBP", quality=quality)
+
+                # Write to ZIP
+                buffer.seek(0)
+                zf.writestr(frame_filename, buffer.read())
+
+        # Generate download URL (full URL)
+        server_address = server_address.rstrip('/')
+        download_url = f"{server_address}/view?filename={zip_filename}&type=output"
+
+        print(f"ZIP created: {zip_path}")
+        print(f"Download URL: {download_url}")
+        print(f"Click or copy the URL above to download")
+
+        return {
+            "ui": {
+                "text": [
+                    f"Packed {b} frames to {zip_filename}",
+                    f"Download: {download_url}"
+                ],
+            },
+            "result": (zip_path, download_url)
+        }

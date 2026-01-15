@@ -33,7 +33,7 @@ from .nodes.inference import (
 from .nodes.cutie import CutieProcess
 from .nodes.vitmatte import ViTMatteRefine, TrimapVisualize
 from .nodes.alpha_ops import AlphaCombine
-from .nodes.output import ApplyAlpha, FrameSelector, PreviewSlider
+from .nodes.output import ApplyAlpha, FrameSelector, PreviewSlider, ImageSequencePackager
 
 NODE_CLASS_MAPPINGS = {
     # Loaders
@@ -59,6 +59,7 @@ NODE_CLASS_MAPPINGS = {
     "PreviewSlider": PreviewSlider,
     # Output
     "ApplyAlpha": ApplyAlpha,
+    "ImageSequencePackager": ImageSequencePackager,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -85,6 +86,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PreviewSlider": "Preview Slider",
     # Output
     "ApplyAlpha": "Apply Alpha",
+    "ImageSequencePackager": "Image Sequence Packager",
 }
 
 WEB_DIRECTORY = "./web"
