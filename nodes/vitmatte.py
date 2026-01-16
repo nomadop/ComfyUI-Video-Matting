@@ -202,17 +202,29 @@ class TrimapVisualize:
 
         Args:
             images: [B, H, W, C] tensor (ComfyUI IMAGE format)
-            trimap: [B, H, W] tensor (0/128/255 values)
+            trimap: [B, H, W] or [2*B, H, W] tensor (0/128/255 values)
+                    If 2*B, assumes 2-pass mode: first B is fwd (0→B-1),
+                    next B is bwd (B-1→0 execution order)
             overlay_alpha: transparency of overlay
             output_scale: downsample output
 
         Returns:
-            visualization: [B, H, W, C] tensor
+            visualization: [B, H, W, C] or [2*B, H, W, C] tensor
         """
         images_np = (images.cpu().numpy() * 255).astype(np.uint8)
         trimap_np = trimap.cpu().numpy()
 
-        b, h, w, c = images_np.shape
+        b_img = images_np.shape[0]
+        b_tri = trimap_np.shape[0]
+
+        # Handle 2-pass mode: trimap has 2x frames
+        if b_tri == 2 * b_img:
+            # fwd part (0:B) uses images in order
+            # bwd part (B:2B) uses images in reverse order (matches execution order B-1→0)
+            images_for_bwd = images_np[::-1].copy()
+            images_np = np.concatenate([images_np, images_for_bwd], axis=0)
+
+        b = trimap_np.shape[0]
         visualizations = []
 
         for i in range(b):
