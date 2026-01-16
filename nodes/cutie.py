@@ -18,8 +18,6 @@ import comfy.utils
 class CutieProcess:
     """Cutie video propagation with optional ViTMatte refinement"""
 
-    BLEND_MODES = ["distance_blend", "avg", "max", "min", "multiply", "bwd_dominant"]
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -43,12 +41,11 @@ class CutieProcess:
                 "dilate_iter": ("INT", {"default": 2, "min": 0, "max": 5, "tooltip": "Dilation iterations"}),
                 "vitmatte_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32, "tooltip": "Max size for ViTMatte (0=original)"}),
                 "enable_2pass": ("BOOLEAN", {"default": False, "tooltip": "Enable 2-pass bidirectional propagation"}),
-                "blend_mode": (cls.BLEND_MODES, {"default": "distance_blend", "tooltip": "Alpha blending mode for 2-pass"}),
             }
         }
 
-    RETURN_TYPES = ("MASK", "MASK", "MASK")
-    RETURN_NAMES = ("mask", "alpha", "trimap")
+    RETURN_TYPES = ("MASK", "MASK", "MASK", "MASK")
+    RETURN_NAMES = ("mask", "alpha_fwd", "alpha_bwd", "trimap")
     FUNCTION = "process"
     CATEGORY = "Video Matting"
 
@@ -58,7 +55,7 @@ class CutieProcess:
                 keyframe_indices="0", mask_threshold=0.5,
                 fg_thresh=0.95, bg_thresh=0.05, conflict_thresh=0.1,
                 erode_size=5, erode_iter=1, dilate_size=5, dilate_iter=2,
-                vitmatte_size=0, enable_2pass=False, blend_mode="distance_blend"):
+                vitmatte_size=0, enable_2pass=False):
         """
         Process video frames through Cutie with optional refinement.
 
@@ -71,11 +68,11 @@ class CutieProcess:
             vitmatte_model: VITMATTE_MODEL for per-frame refinement
             keyframe_indices: comma-separated frame indices "0,50,100"
             enable_2pass: enable bidirectional 2-pass propagation
-            blend_mode: alpha blending mode for 2-pass
 
         Returns:
             mask: [B, H, W] or [2*B, H, W] propagated masks
-            alpha: [B, H, W] refined alphas (blended if 2-pass)
+            alpha_fwd: [B, H, W] forward pass alphas
+            alpha_bwd: [B, H, W] backward pass alphas (same as fwd if not 2-pass)
             trimap: [B, H, W] or [2*B, H, W] generated trimaps
         """
         processor = cutie_model["processor"]
@@ -127,7 +124,8 @@ class CutieProcess:
             alpha_tensor = torch.from_numpy(np.stack(alphas, axis=0)).float()
             trimap_tensor = torch.from_numpy(np.stack(trimaps, axis=0)).float()
 
-            return (mask_tensor, alpha_tensor, trimap_tensor)
+            # Return 4 outputs: alpha_bwd = alpha_fwd for compatibility
+            return (mask_tensor, alpha_tensor, alpha_tensor, trimap_tensor)
 
         # === 2-Pass Mode ===
 
@@ -167,23 +165,21 @@ class CutieProcess:
             vitmatte_size=vitmatte_size,
             pass_name="Cutie[bwd]"
         )
-        # Note: masks_bwd is in execution order (B-1 → 0), NOT reversed
+        # Note: masks_bwd/trimaps_bwd are in execution order (B-1 → 0), kept for debug
 
-        # Blend alphas
-        # alphas_fwd[i] corresponds to frame[i]
-        # alphas_bwd[i] corresponds to frame[B-1-i], need to reverse for blending
-        alphas_bwd_reversed = alphas_bwd[::-1]  # Now aligned with frame[0→B-1]
-        alpha_blended = self._blend_alphas(alphas_fwd, alphas_bwd_reversed, blend_mode)
+        # alpha_bwd needs to be reversed to align with alpha_fwd (frame 0→B-1)
+        alphas_bwd_aligned = alphas_bwd[::-1]
 
-        # Concatenate outputs (bwd keeps execution order for debug)
+        # Concatenate mask/trimap (bwd keeps execution order for debug)
         mask_concat = np.concatenate([np.stack(masks_fwd), np.stack(masks_bwd)], axis=0)
         trimap_concat = np.concatenate([np.stack(trimaps_fwd), np.stack(trimaps_bwd)], axis=0)
 
         mask_tensor = torch.from_numpy(mask_concat).float()
-        alpha_tensor = torch.from_numpy(alpha_blended).float()
+        alpha_fwd_tensor = torch.from_numpy(np.stack(alphas_fwd, axis=0)).float()
+        alpha_bwd_tensor = torch.from_numpy(np.stack(alphas_bwd_aligned, axis=0)).float()
         trimap_tensor = torch.from_numpy(trimap_concat).float()
 
-        return (mask_tensor, alpha_tensor, trimap_tensor)
+        return (mask_tensor, alpha_fwd_tensor, alpha_bwd_tensor, trimap_tensor)
 
     def _run_pass(self, processor, device, images_np,
                   init_mask, kf_indices, kf_masks_np, correction_np,
@@ -286,45 +282,6 @@ class CutieProcess:
                 pbar.update(1)
 
         return output_masks, output_alphas, output_trimaps
-
-    def _blend_alphas(self, alphas_fwd, alphas_bwd, mode):
-        """
-        Blend two alpha sequences.
-
-        Args:
-            alphas_fwd: list of [H, W] arrays (frame 0→B-1)
-            alphas_bwd: list of [H, W] arrays (frame 0→B-1, already reversed)
-            mode: blend mode string
-
-        Returns:
-            blended: [B, H, W] numpy array
-        """
-        B = len(alphas_fwd)
-        result = []
-
-        for i in range(B):
-            a_fwd = alphas_fwd[i]
-            a_bwd = alphas_bwd[i]
-
-            if mode == "distance_blend":
-                w = i / (B - 1) if B > 1 else 0.5
-                blended = w * a_fwd + (1 - w) * a_bwd
-            elif mode == "avg":
-                blended = (a_fwd + a_bwd) / 2
-            elif mode == "max":
-                blended = np.maximum(a_fwd, a_bwd)
-            elif mode == "min":
-                blended = np.minimum(a_fwd, a_bwd)
-            elif mode == "multiply":
-                blended = a_fwd * a_bwd
-            elif mode == "bwd_dominant":
-                blended = 0.3 * a_fwd + 0.7 * a_bwd
-            else:
-                blended = (a_fwd + a_bwd) / 2
-
-            result.append(blended)
-
-        return np.stack(result, axis=0)
 
     def _generate_trimap_from_mask(self, mask, erode_size, erode_iter, dilate_size, dilate_iter):
         """Generate trimap from binary mask using morphology"""
