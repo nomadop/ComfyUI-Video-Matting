@@ -261,13 +261,13 @@ class ImageSequencePackager:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
                 "filename_prefix": ("STRING", {"default": "sequence"}),
                 "format": (cls.FORMAT_OPTIONS, {"default": "png"}),
             },
             "optional": {
+                "images": ("IMAGE",),
+                "masks": ("MASK", {"tooltip": "Pack masks as grayscale PNG (ignores format/quality, always PNG)"}),
                 "quality": ("INT", {"default": 95, "min": 1, "max": 100, "step": 1, "tooltip": "Quality for JPG/WebP (1-100)"}),
-                "server_address": ("STRING", {"default": "http://localhost:8188", "tooltip": "ComfyUI server address for download URL"}),
             }
         }
 
@@ -277,23 +277,32 @@ class ImageSequencePackager:
     OUTPUT_NODE = True
     CATEGORY = "Video Matting/Output"
 
-    def pack(self, images, filename_prefix, format, quality=95, server_address="http://localhost:8188"):
-        """Pack image sequence to ZIP
+    def pack(self, filename_prefix, format, images=None, masks=None, quality=95):
+        """Pack image/mask sequence to ZIP
 
         Args:
-            images: [B, H, W, C] tensor (ComfyUI IMAGE format)
             filename_prefix: prefix for ZIP filename
             format: image format (png/jpg/webp)
+            images: optional [B, H, W, C] tensor (ComfyUI IMAGE format)
+            masks: optional [B, H, W] tensor (packed as grayscale PNG)
             quality: quality for lossy formats
-            server_address: ComfyUI server address for full download URL
 
         Returns:
             zip_path: absolute path to ZIP file
             download_url: full URL for downloading via ComfyUI server
         """
         from tqdm import tqdm
+        from io import BytesIO
 
-        b, h, w, c = images.shape
+        if images is None and masks is None:
+            raise ValueError("At least one of 'images' or 'masks' must be provided")
+
+        # Prefer masks if provided (grayscale PNG mode), otherwise use images
+        use_mask = masks is not None
+        if use_mask:
+            b, h, w = masks.shape
+        else:
+            b, h, w, c = images.shape
 
         # Generate unique filename with timestamp
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -301,45 +310,48 @@ class ImageSequencePackager:
         zip_path = os.path.join(self.output_dir, zip_filename)
 
         # Create ZIP file
-        print(f"Packing {b} frames to {zip_filename}...")
+        source_label = "mask frames" if use_mask else "frames"
+        print(f"Packing {b} {source_label} to {zip_filename}...")
 
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for i in tqdm(range(b), desc="Packing"):
-                frame = images[i].cpu().numpy()
-
-                # Convert to PIL Image
-                if c == 4:
-                    # RGBA
-                    img_array = np.clip(frame * 255, 0, 255).astype(np.uint8)
-                    img = Image.fromarray(img_array, mode='RGBA')
-                else:
-                    # RGB
-                    img_array = np.clip(frame * 255, 0, 255).astype(np.uint8)
-                    img = Image.fromarray(img_array, mode='RGB')
-
-                # Determine frame filename (pure numbers, no prefix)
-                frame_filename = f"{i:05d}.{format}"
-
-                # Save to bytes buffer
-                from io import BytesIO
                 buffer = BytesIO()
 
-                if format == "png":
+                if use_mask:
+                    # Mask mode: always grayscale PNG
+                    frame = masks[i].cpu().numpy()
+                    img_array = np.clip(frame * 255, 0, 255).astype(np.uint8)
+                    img = Image.fromarray(img_array, mode='L')
+                    frame_filename = f"{i:05d}.png"
                     img.save(buffer, format="PNG", compress_level=6)
-                elif format == "jpg":
+                else:
+                    # Image mode: respect format setting
+                    frame = images[i].cpu().numpy()
+
                     if c == 4:
-                        img = img.convert('RGB')
-                    img.save(buffer, format="JPEG", quality=quality)
-                elif format == "webp":
-                    img.save(buffer, format="WEBP", quality=quality)
+                        img_array = np.clip(frame * 255, 0, 255).astype(np.uint8)
+                        img = Image.fromarray(img_array, mode='RGBA')
+                    else:
+                        img_array = np.clip(frame * 255, 0, 255).astype(np.uint8)
+                        img = Image.fromarray(img_array, mode='RGB')
+
+                    frame_filename = f"{i:05d}.{format}"
+
+                    if format == "png":
+                        img.save(buffer, format="PNG", compress_level=6)
+                    elif format == "jpg":
+                        if c == 4:
+                            img = img.convert('RGB')
+                        img.save(buffer, format="JPEG", quality=quality)
+                    elif format == "webp":
+                        img.save(buffer, format="WEBP", quality=quality)
 
                 # Write to ZIP
                 buffer.seek(0)
                 zf.writestr(frame_filename, buffer.read())
 
-        # Generate download URL (full URL)
-        server_address = server_address.rstrip('/')
-        download_url = f"{server_address}/view?filename={zip_filename}&type=output"
+        # Generate download URL (relative path, frontend will resolve with current origin)
+        download_url = f"/view?filename={zip_filename}&type=output"
 
         print(f"ZIP created: {zip_path}")
         print(f"Download URL: {download_url}")
@@ -348,7 +360,7 @@ class ImageSequencePackager:
         return {
             "ui": {
                 "text": [
-                    f"Packed {b} frames to {zip_filename}",
+                    f"Packed {b} {source_label} to {zip_filename}",
                     f"Download: {download_url}"
                 ],
             },

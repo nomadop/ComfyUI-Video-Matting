@@ -249,6 +249,7 @@ class CutieLoader:
 
         from omegaconf import open_dict
         from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
         from cutie.model.cutie import CUTIE
         from cutie.inference.inference_core import InferenceCore
         from cutie.inference.utils.args_utils import get_dataset_cfg
@@ -263,6 +264,8 @@ class CutieLoader:
         repo_path = os.path.expanduser(CONFIG['model_repos']['cutie']['path'])
         config_dir = os.path.join(repo_path, 'cutie', 'config')
 
+        # Clear previous Hydra state to allow re-initialization
+        GlobalHydra.instance().clear()
         initialize_config_dir(version_base='1.3.2', config_dir=config_dir)
         cfg = compose(config_name="eval_config")
 

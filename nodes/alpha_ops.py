@@ -3,10 +3,45 @@ Alpha Operation Nodes
 
 - AlphaCombine: Combine multiple alpha channels
 - TwoPassBlend: Blend two alpha sequences from 2-pass propagation
+- MaskToGrayscaleImage: Convert mask to grayscale IMAGE for preview/export
 """
 
 import torch
 import numpy as np
+
+
+class MaskToGrayscaleImage:
+    """Convert MASK [B,H,W] to grayscale IMAGE [B,H,W,3]
+
+    Useful for previewing masks, exporting as grayscale PNG sequences,
+    or any workflow that needs mask data in IMAGE format.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "convert"
+    CATEGORY = "Video Matting/Alpha"
+
+    def convert(self, mask):
+        """Convert mask to grayscale image
+
+        Args:
+            mask: [B, H, W] float32 tensor [0,1]
+
+        Returns:
+            image: [B, H, W, 3] float32 tensor (grayscale replicated to RGB)
+        """
+        # [B, H, W] -> [B, H, W, 1] -> [B, H, W, 3]
+        gray = mask.unsqueeze(-1).expand(-1, -1, -1, 3)
+        return (gray,)
 
 
 class AlphaCombine:

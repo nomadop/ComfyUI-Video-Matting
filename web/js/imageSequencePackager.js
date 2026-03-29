@@ -100,7 +100,9 @@ app.registerExtension({
 
                 // Parse download URL
                 if (urlText && urlText.startsWith("Download: ")) {
-                    this.downloadUrl = urlText.replace("Download: ", "");
+                    const rawUrl = urlText.replace("Download: ", "");
+                    // Resolve relative paths using current browser origin
+                    this.downloadUrl = rawUrl.startsWith("/") ? window.location.origin + rawUrl : rawUrl;
 
                     // Extract filename from URL
                     const match = this.downloadUrl.match(/filename=([^&]+)/);
