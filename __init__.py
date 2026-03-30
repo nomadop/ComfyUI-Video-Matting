@@ -34,6 +34,7 @@ from .nodes.cutie import CutieProcess
 from .nodes.vitmatte import ViTMatteRefine, TrimapVisualize
 from .nodes.alpha_ops import AlphaCombine, TwoPassBlend, MaskToGrayscaleImage
 from .nodes.output import ApplyAlpha, FrameSelector, PreviewSlider, ImageSequencePackager
+from .nodes.raft import RAFTLoader, AlphaDeflicker
 
 NODE_CLASS_MAPPINGS = {
     # Loaders
@@ -62,6 +63,9 @@ NODE_CLASS_MAPPINGS = {
     # Output
     "ApplyAlpha": ApplyAlpha,
     "ImageSequencePackager": ImageSequencePackager,
+    # Optical Flow
+    "RAFTLoader": RAFTLoader,
+    "AlphaDeflicker": AlphaDeflicker,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -91,6 +95,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # Output
     "ApplyAlpha": "Apply Alpha",
     "ImageSequencePackager": "Image Sequence Packager",
+    # Optical Flow
+    "RAFTLoader": "RAFT Loader",
+    "AlphaDeflicker": "Alpha Deflicker",
 }
 
 WEB_DIRECTORY = "./web"

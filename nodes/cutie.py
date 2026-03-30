@@ -42,9 +42,11 @@ class CutieProcess:
                 "dilate_iter": ("INT", {"default": 2, "min": 0, "max": 5, "tooltip": "Dilation iterations"}),
                 "vitmatte_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 32, "tooltip": "Max size for ViTMatte (0=original)"}),
                 "enable_2pass": ("BOOLEAN", {"default": False, "tooltip": "Enable 2-pass bidirectional propagation"}),
-                "blend_mode": (["none", "distance_blend", "avg", "max", "min", "multiply", "bwd_dominant"],
+                "blend_mode": (["none", "distance_blend", "avg", "max", "min", "multiply", "bwd_dominant", "bwd_only"],
                                {"default": "distance_blend",
                                 "tooltip": "Blend mode for 2-pass alpha fusion (replaces TwoPassBlend node). 'none' returns unblended forward alpha."}),
+                "correction_distance": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1,
+                                                "tooltip": "Max pixels per frame that correction can ADD foreground (0=unlimited). Rate-limits addition from cutie_fg_core boundary outward. Does not affect deletion."}),
             }
         }
 
@@ -59,7 +61,8 @@ class CutieProcess:
                 keyframe_indices="0", mask_threshold=0.5,
                 fg_thresh=0.95, bg_thresh=0.05, conflict_thresh=0.1,
                 erode_size=5, erode_iter=1, dilate_size=5, dilate_iter=2,
-                vitmatte_size=0, enable_2pass=False, blend_mode="distance_blend"):
+                vitmatte_size=0, enable_2pass=False, blend_mode="distance_blend",
+                correction_distance=0):
         processor = cutie_model["processor"]
         device = cutie_model["device"]
         b = images.shape[0]
@@ -83,6 +86,7 @@ class CutieProcess:
             "dilate_iter": dilate_iter,
             "fg_thresh": fg_thresh,
             "conflict_thresh": conflict_thresh,
+            "correction_distance": correction_distance,
         }
 
         if not enable_2pass:
@@ -124,7 +128,7 @@ class CutieProcess:
         processor.clear_memory()
 
         # Backward pass (B-1 → 0) — reverse iteration, no array copy
-        _, alphas_bwd, _ = self._run_pass(
+        _, alphas_bwd, trimaps_bwd = self._run_pass(
             processor, device, images,
             reverse=True,
             alpha_only=True,
@@ -138,7 +142,7 @@ class CutieProcess:
             vitmatte_size=vitmatte_size,
             pass_name="Cutie[bwd]"
         )
-        # alphas_bwd is in reverse processing order: [orig B-1, ..., orig 0]
+        # alphas_bwd/trimaps_bwd are in reverse processing order: [orig B-1, ..., orig 0]
 
         if blend_mode != "none":
             alphas_blended = self._blend_passes(alphas_fwd, alphas_bwd, blend_mode)
@@ -149,7 +153,15 @@ class CutieProcess:
             alpha_tensor = torch.from_numpy(np.stack(alphas_fwd, axis=0)).float()
 
         mask_tensor = torch.from_numpy(np.stack(masks_fwd, axis=0)).float()
-        trimap_tensor = torch.from_numpy(np.stack(trimaps_fwd, axis=0)).float()
+
+        # Trimap: concatenate fwd [0→B-1] + bwd [B-1→0 execution order]
+        # TrimapVisualize handles 2*B by matching bwd with reversed images
+        if trimaps_bwd:
+            all_trimaps = trimaps_fwd + trimaps_bwd
+            trimap_tensor = torch.from_numpy(np.stack(all_trimaps, axis=0)).float()
+        else:
+            trimap_tensor = torch.from_numpy(np.stack(trimaps_fwd, axis=0)).float()
+
         return (mask_tensor, alpha_tensor, trimap_tensor)
 
     def _run_pass(self, processor, device, images,
@@ -215,16 +227,17 @@ class CutieProcess:
                         cutie_mask, correction_np[frame_idx],
                         trimap_params["erode_size"], trimap_params["erode_iter"],
                         trimap_params["dilate_size"], trimap_params["dilate_iter"],
-                        trimap_params["fg_thresh"], trimap_params["conflict_thresh"]
+                        trimap_params["fg_thresh"], trimap_params["conflict_thresh"],
+                        trimap_params["correction_distance"]
                     )
-                elif vitmatte_model is not None or not alpha_only:
+                else:
                     trimap = self._generate_trimap_from_mask(
                         cutie_mask,
                         trimap_params["erode_size"], trimap_params["erode_iter"],
                         trimap_params["dilate_size"], trimap_params["dilate_iter"]
                     )
 
-                if not alpha_only and trimap is not None:
+                if trimap is not None:
                     output_trimaps.append(trimap)
 
                 # Optionally refine with ViTMatte
@@ -269,6 +282,8 @@ class CutieProcess:
                 blended = a_fwd * a_bwd
             elif blend_mode == "bwd_dominant":
                 blended = 0.3 * a_fwd + 0.7 * a_bwd
+            elif blend_mode == "bwd_only":
+                blended = a_bwd
             else:
                 blended = (a_fwd + a_bwd) / 2
 
@@ -294,8 +309,13 @@ class CutieProcess:
 
     def _generate_hybrid_trimap(self, cutie_mask, correction_alpha,
                                  erode_size, erode_iter, dilate_size, dilate_iter,
-                                 fg_thresh, conflict_thresh):
-        """Generate trimap from Cutie mask + correction alpha"""
+                                 fg_thresh, conflict_thresh, correction_distance=0):
+        """Generate trimap from Cutie mask + correction alpha.
+
+        When correction_distance > 0, foreground ADDITION is rate-limited:
+        correction can only add FG within correction_distance pixels of
+        cutie_fg_core boundary per frame. Deletion is unrestricted.
+        """
         cutie_binary = (cutie_mask > 0.5).astype(np.uint8)
         h, w = cutie_binary.shape
 
@@ -312,9 +332,17 @@ class CutieProcess:
         corr_soft = (correction_alpha > conflict_thresh).astype(np.uint8)
         corr_bg = (correction_alpha < conflict_thresh).astype(np.uint8)
 
+        # Rate-limit addition: correction can only add FG within D pixels
+        # outside cutie_fg_core boundary. Over multiple frames, the boundary
+        # moves outward as additions are accepted → progressive growth.
+        if correction_distance > 0:
+            dist_outside_core = cv2.distanceTransform(1 - cutie_fg_core, cv2.DIST_L2, 5)
+            add_zone = (dist_outside_core <= correction_distance).astype(np.uint8)
+            corr_fg_core = corr_fg_core & add_zone
+
         soft_dilated = cv2.dilate(corr_soft, dilate_kernel, iterations=dilate_iter)
 
-        # Conflict: correction says BG but Cutie says FG
+        # Conflict: correction says BG but Cutie says FG (unrestricted)
         conflict = ((corr_bg == 1) & (cutie_fg_core == 1)).astype(np.uint8)
 
         # Union FG
