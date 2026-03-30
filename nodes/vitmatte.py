@@ -225,6 +225,7 @@ class TrimapVisualize:
             images_np = np.concatenate([images_np, images_for_bwd], axis=0)
 
         b = trimap_np.shape[0]
+        pbar = comfy.utils.ProgressBar(b)
         visualizations = []
 
         for i in range(b):
@@ -232,6 +233,7 @@ class TrimapVisualize:
                 images_np[i], trimap_np[i], overlay_alpha, output_scale
             )
             visualizations.append(vis)
+            pbar.update(1)
 
         vis_np = np.stack(visualizations, axis=0)
         vis_tensor = torch.from_numpy(vis_np).float() / 255.0

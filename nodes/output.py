@@ -13,6 +13,7 @@ import zipfile
 import time
 import torch
 import numpy as np
+import comfy.utils
 from PIL import Image
 import folder_paths
 
@@ -208,6 +209,7 @@ class PreviewSlider:
         # Process images
         if images is not None:
             b, h, w, c = images.shape
+            pbar = comfy.utils.ProgressBar(b)
             for i in range(b):
                 frame = images[i].cpu().numpy()
                 img = Image.fromarray(np.clip(frame * 255, 0, 255).astype(np.uint8))
@@ -221,10 +223,12 @@ class PreviewSlider:
                     "subfolder": "",
                     "type": self.type
                 })
+                pbar.update(1)
 
         # Process mask (if no images provided)
         elif mask is not None:
             b, h, w = mask.shape
+            pbar = comfy.utils.ProgressBar(b)
             for i in range(b):
                 frame = mask[i].cpu().numpy()
                 mask_uint8 = np.clip(frame * 255, 0, 255).astype(np.uint8)
@@ -239,6 +243,7 @@ class PreviewSlider:
                     "subfolder": "",
                     "type": self.type
                 })
+                pbar.update(1)
 
         # Return only frames for slider (no images to avoid default preview)
         return {"ui": {"frames": frames}}
@@ -313,6 +318,7 @@ class ImageSequencePackager:
         source_label = "mask frames" if use_mask else "frames"
         print(f"Packing {b} {source_label} to {zip_filename}...")
 
+        pbar = comfy.utils.ProgressBar(b)
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for i in tqdm(range(b), desc="Packing"):
                 buffer = BytesIO()
@@ -349,6 +355,7 @@ class ImageSequencePackager:
                 # Write to ZIP
                 buffer.seek(0)
                 zf.writestr(frame_filename, buffer.read())
+                pbar.update(1)
 
         # Generate download URL (relative path, frontend will resolve with current origin)
         download_url = f"/view?filename={zip_filename}&type=output"

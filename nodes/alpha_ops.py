@@ -8,6 +8,7 @@ Alpha Operation Nodes
 
 import torch
 import numpy as np
+import comfy.utils
 
 
 class MaskToGrayscaleImage:
@@ -149,6 +150,7 @@ class TwoPassBlend:
         alphas_bwd = alpha_bwd.cpu().numpy()
         B = alphas_fwd.shape[0]
 
+        pbar = comfy.utils.ProgressBar(B)
         result = []
         for i in range(B):
             a_fwd = alphas_fwd[i]
@@ -171,6 +173,7 @@ class TwoPassBlend:
                 blended = (a_fwd + a_bwd) / 2
 
             result.append(blended)
+            pbar.update(1)
 
         alpha_tensor = torch.from_numpy(np.stack(result, axis=0)).float()
         return (alpha_tensor,)
