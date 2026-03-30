@@ -359,6 +359,11 @@ class ImageSequencePackager:
 
         return {
             "ui": {
+                "images": [{
+                    "filename": zip_filename,
+                    "subfolder": "",
+                    "type": self.type,
+                }],
                 "text": [
                     f"Packed {b} {source_label} to {zip_filename}",
                     f"Download: {download_url}"
