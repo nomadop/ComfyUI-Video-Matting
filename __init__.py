@@ -35,6 +35,7 @@ from .nodes.vitmatte import ViTMatteRefine, TrimapVisualize
 from .nodes.alpha_ops import AlphaCombine, TwoPassBlend, MaskToGrayscaleImage
 from .nodes.output import ApplyAlpha, FrameSelector, PreviewSlider, ImageSequencePackager
 from .nodes.raft import RAFTLoader, AlphaDeflicker
+from .nodes.flickerformer import FlickerformerLoader, FlickerformerDeflicker
 
 NODE_CLASS_MAPPINGS = {
     # Loaders
@@ -66,6 +67,9 @@ NODE_CLASS_MAPPINGS = {
     # Optical Flow
     "RAFTLoader": RAFTLoader,
     "AlphaDeflicker": AlphaDeflicker,
+    # Flickerformer
+    "FlickerformerLoader": FlickerformerLoader,
+    "FlickerformerDeflicker": FlickerformerDeflicker,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -98,6 +102,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # Optical Flow
     "RAFTLoader": "RAFT Loader",
     "AlphaDeflicker": "Alpha Deflicker",
+    # Flickerformer
+    "FlickerformerLoader": "Flickerformer Loader",
+    "FlickerformerDeflicker": "Flickerformer Deflicker",
 }
 
 WEB_DIRECTORY = "./web"
