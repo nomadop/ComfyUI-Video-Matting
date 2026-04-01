@@ -32,7 +32,7 @@ from .nodes.inference import (
 # Import other nodes
 from .nodes.cutie import CutieProcess
 from .nodes.vitmatte import ViTMatteRefine, TrimapVisualize
-from .nodes.alpha_ops import AlphaCombine, TwoPassBlend, MaskToGrayscaleImage
+from .nodes.alpha_ops import AlphaCombine, TwoPassBlend, MaskToGrayscaleImage, AlphaCurveBlend
 from .nodes.output import ApplyAlpha, FrameSelector, PreviewSlider, ImageSequencePackager
 from .nodes.raft import RAFTLoader, AlphaDeflicker
 from .nodes.flickerformer import FlickerformerLoader, FlickerformerDeflicker
@@ -57,6 +57,7 @@ NODE_CLASS_MAPPINGS = {
     "AlphaCombine": AlphaCombine,
     "TwoPassBlend": TwoPassBlend,
     "MaskToGrayscaleImage": MaskToGrayscaleImage,
+    "AlphaCurveBlend": AlphaCurveBlend,
     # Debug
     "TrimapVisualize": TrimapVisualize,
     "FrameSelector": FrameSelector,
@@ -92,6 +93,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AlphaCombine": "Alpha Combine",
     "TwoPassBlend": "Two Pass Blend",
     "MaskToGrayscaleImage": "Mask to Grayscale Image",
+    "AlphaCurveBlend": "Alpha Curve Blend",
     # Debug
     "TrimapVisualize": "Trimap Visualize",
     "FrameSelector": "Frame Selector",

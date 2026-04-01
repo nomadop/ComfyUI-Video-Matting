@@ -4,11 +4,18 @@ Alpha Operation Nodes
 - AlphaCombine: Combine multiple alpha channels
 - TwoPassBlend: Blend two alpha sequences from 2-pass propagation
 - MaskToGrayscaleImage: Convert mask to grayscale IMAGE for preview/export
+- AlphaCurveBlend: Blend multiple alpha sources using Bezier curve weights over time
 """
 
+import os
+import json
+import math
+import random
 import torch
 import numpy as np
+from PIL import Image
 import comfy.utils
+import folder_paths
 
 
 class MaskToGrayscaleImage:
@@ -177,3 +184,378 @@ class TwoPassBlend:
 
         alpha_tensor = torch.from_numpy(np.stack(result, axis=0)).float()
         return (alpha_tensor,)
+
+
+class AlphaCurveBlend:
+    """Blend multiple alpha sources using curve weights over time.
+
+    Supports multiple interpolation modes: catmull-rom, linear, monotone, step, gaussian.
+    Features a frontend curve editor with real-time pixel-level preview.
+    """
+
+    INTERP_MODES = ["catmull-rom", "linear", "monotone", "step", "gaussian"]
+
+    DEFAULT_CURVE_DATA = json.dumps({
+        "mode": "catmull-rom",
+        "curves": [{
+            "id": "a",
+            "anchors": [[0, 1], [1, 1]],
+            "color": "#4CAF50",
+        }]
+    })
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix = "_curve_" + ''.join(
+            random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5)
+        )
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "alpha_a": ("MASK",),
+                "curve_data": ("STRING", {
+                    "default": cls.DEFAULT_CURVE_DATA,
+                    "multiline": True,
+                }),
+            },
+            "optional": {
+                "alpha_b": ("MASK",),
+                "alpha_c": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("alpha",)
+    FUNCTION = "blend"
+    OUTPUT_NODE = True
+    CATEGORY = "Video Matting/Alpha"
+
+    def blend(self, alpha_a, curve_data, alpha_b=None, alpha_c=None):
+        sources = {"a": alpha_a}
+        if alpha_b is not None:
+            sources["b"] = alpha_b
+        if alpha_c is not None:
+            sources["c"] = alpha_c
+
+        # Validate all sources have matching shapes
+        B, H, W = alpha_a.shape
+        for src_id, tensor in sources.items():
+            if src_id == "a":
+                continue
+            if tensor.shape[1:] != (H, W):
+                raise ValueError(
+                    f"alpha_{src_id} spatial size {tensor.shape[1:]} "
+                    f"does not match alpha_a ({H}, {W})"
+                )
+            if tensor.shape[0] != B:
+                raise ValueError(
+                    f"alpha_{src_id} has {tensor.shape[0]} frames, "
+                    f"expected {B} (same as alpha_a)"
+                )
+        curves, mode = self._parse_curves(curve_data, sources)
+
+        # Save source frames as temp PNGs for frontend preview
+        source_frames = {}
+        for src_id, tensor in sources.items():
+            source_frames[src_id] = self._save_frames(tensor, src_id)
+
+        # Blend
+        pbar = comfy.utils.ProgressBar(B)
+        result = []
+        for i in range(B):
+            t = i / (B - 1) if B > 1 else 0.0
+            weights = {}
+            weight_sum = 0.0
+            for curve in curves:
+                sid = curve["id"]
+                if sid not in sources:
+                    continue
+                w = max(0.0, self._eval_anchors_at_x(curve["anchors"], t, mode))
+                weights[sid] = w
+                weight_sum += w
+
+            if weight_sum == 0:
+                weight_sum = 1.0
+
+            frame = torch.zeros_like(alpha_a[0])
+            for sid, w in weights.items():
+                frame += sources[sid][i] * (w / weight_sum)
+            result.append(frame)
+            pbar.update(1)
+
+        blended = torch.stack(result, dim=0)
+
+        return {
+            "ui": {
+                "source_frames": [source_frames],
+                "total_frames": [B],
+            },
+            "result": (blended,),
+        }
+
+    def _save_frames(self, tensor, src_id):
+        """Save all frames of a MASK tensor as grayscale temp PNGs."""
+        B = tensor.shape[0]
+        frames = []
+        for i in range(B):
+            arr = (tensor[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img = Image.fromarray(arr, mode='L')
+            filename = f"{self.prefix}_{src_id}_{i:05d}.png"
+            filepath = os.path.join(self.output_dir, filename)
+            img.save(filepath, compress_level=self.compress_level)
+            frames.append({
+                "filename": filename,
+                "subfolder": "",
+                "type": self.type,
+            })
+        return frames
+
+    def _parse_curves(self, curve_data, sources):
+        """Parse curve_data JSON. Returns (curves_list, mode)."""
+        mode = "catmull-rom"
+        try:
+            data = json.loads(curve_data)
+            curves = data.get("curves", [])
+            mode = data.get("mode", "catmull-rom")
+        except (json.JSONDecodeError, TypeError):
+            curves = []
+
+        if mode not in self.INTERP_MODES:
+            mode = "catmull-rom"
+
+        # Ensure anchors exist on each curve
+        for c in curves:
+            if "anchors" not in c:
+                c["anchors"] = [[0, 1], [1, 1]]
+
+        # Ensure all sources have a curve
+        valid_ids = {c["id"] for c in curves if c.get("id") in sources}
+        for sid in sources:
+            if sid not in valid_ids:
+                curves.append({
+                    "id": sid,
+                    "anchors": [[0, 1], [1, 1]],
+                    "color": "#888",
+                })
+
+        return [c for c in curves if c.get("id") in sources], mode
+
+    # ── Interpolation dispatcher ─────────────────────────────────
+
+    @staticmethod
+    def _eval_anchors_at_x(anchors, x, mode):
+        """Evaluate curve at x using the specified interpolation mode."""
+        if mode == "linear":
+            return AlphaCurveBlend._eval_linear(anchors, x)
+        elif mode == "step":
+            return AlphaCurveBlend._eval_step(anchors, x)
+        elif mode == "monotone":
+            return AlphaCurveBlend._eval_monotone(anchors, x)
+        elif mode == "gaussian":
+            return AlphaCurveBlend._eval_gaussian(anchors, x)
+        else:  # catmull-rom
+            return AlphaCurveBlend._eval_catmull_rom(anchors, x)
+
+    # ── Linear ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _eval_linear(anchors, x):
+        n = len(anchors)
+        if n == 0:
+            return 1.0
+        if n == 1 or x <= anchors[0][0]:
+            return max(0.0, min(1.0, anchors[0][1]))
+        if x >= anchors[-1][0]:
+            return max(0.0, min(1.0, anchors[-1][1]))
+        for i in range(n - 1):
+            if x <= anchors[i + 1][0]:
+                dx = anchors[i + 1][0] - anchors[i][0]
+                if dx < 1e-9:
+                    return max(0.0, min(1.0, anchors[i][1]))
+                t = (x - anchors[i][0]) / dx
+                y = anchors[i][1] + t * (anchors[i + 1][1] - anchors[i][1])
+                return max(0.0, min(1.0, y))
+        return max(0.0, min(1.0, anchors[-1][1]))
+
+    # ── Step ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _eval_step(anchors, x):
+        if not anchors:
+            return 1.0
+        for i in range(len(anchors) - 1, -1, -1):
+            if x >= anchors[i][0]:
+                return max(0.0, min(1.0, anchors[i][1]))
+        return max(0.0, min(1.0, anchors[0][1]))
+
+    # ── Monotone cubic (Fritsch-Carlson) ─────────────────────────
+
+    @staticmethod
+    def _eval_monotone(anchors, x):
+        n = len(anchors)
+        if n == 0:
+            return 1.0
+        if n == 1 or x <= anchors[0][0]:
+            return max(0.0, min(1.0, anchors[0][1]))
+        if x >= anchors[-1][0]:
+            return max(0.0, min(1.0, anchors[-1][1]))
+
+        dx = [anchors[i + 1][0] - anchors[i][0] for i in range(n - 1)]
+        dy = [anchors[i + 1][1] - anchors[i][1] for i in range(n - 1)]
+        delta = [dy[i] / dx[i] if dx[i] > 1e-9 else 0.0 for i in range(n - 1)]
+
+        # Initial tangents
+        m = [0.0] * n
+        m[0] = delta[0]
+        for i in range(1, n - 1):
+            m[i] = (delta[i - 1] + delta[i]) / 2
+        m[-1] = delta[-1]
+
+        # Fritsch-Carlson modification
+        for i in range(n - 1):
+            if abs(delta[i]) < 1e-9:
+                m[i] = 0.0
+                m[i + 1] = 0.0
+            else:
+                alpha = m[i] / delta[i]
+                beta = m[i + 1] / delta[i]
+                s = alpha * alpha + beta * beta
+                if s > 9:
+                    tau = 3.0 / math.sqrt(s)
+                    m[i] = tau * alpha * delta[i]
+                    m[i + 1] = tau * beta * delta[i]
+
+        # Find segment and evaluate cubic Hermite
+        for i in range(n - 1):
+            if x <= anchors[i + 1][0]:
+                h = dx[i]
+                if h < 1e-9:
+                    return max(0.0, min(1.0, anchors[i][1]))
+                t = (x - anchors[i][0]) / h
+                t2, t3 = t * t, t * t * t
+                h00 = 2 * t3 - 3 * t2 + 1
+                h10 = t3 - 2 * t2 + t
+                h01 = -2 * t3 + 3 * t2
+                h11 = t3 - t2
+                y = h00 * anchors[i][1] + h10 * h * m[i] + h01 * anchors[i + 1][1] + h11 * h * m[i + 1]
+                return max(0.0, min(1.0, y))
+
+        return max(0.0, min(1.0, anchors[-1][1]))
+
+    # ── Gaussian RBF ─────────────────────────────────────────────
+
+    @staticmethod
+    def _eval_gaussian(anchors, x):
+        n = len(anchors)
+        if n == 0:
+            return 1.0
+        if n == 1:
+            return max(0.0, min(1.0, anchors[0][1]))
+
+        num, den = 0.0, 0.0
+        for i in range(n):
+            if i == 0:
+                sigma = (anchors[1][0] - anchors[0][0]) * 0.6
+            elif i == n - 1:
+                sigma = (anchors[-1][0] - anchors[-2][0]) * 0.6
+            else:
+                sigma = min(anchors[i][0] - anchors[i - 1][0],
+                            anchors[i + 1][0] - anchors[i][0]) * 0.6
+            sigma = max(sigma, 0.01)
+            d = x - anchors[i][0]
+            g = math.exp(-(d * d) / (2 * sigma * sigma))
+            num += anchors[i][1] * g
+            den += g
+
+        if den <= 0:
+            return 1.0
+        return max(0.0, min(1.0, num / den))
+
+    # ── Catmull-Rom (via cubic Bezier) ───────────────────────────
+
+    @staticmethod
+    def _eval_catmull_rom(anchors, x):
+        """Convert anchors to Bezier points, then evaluate."""
+        points = AlphaCurveBlend._anchors_to_points(anchors)
+        return AlphaCurveBlend._eval_bezier_at_x(points, x)
+
+    @staticmethod
+    def _anchors_to_points(anchors):
+        """Convert anchors to cubic Bezier control points (Catmull-Rom)."""
+        n = len(anchors)
+        if n < 2:
+            return list(anchors)
+        if n == 2:
+            x0, y0 = anchors[0]
+            x1, y1 = anchors[1]
+            return [
+                [x0, y0],
+                [x0 + (x1 - x0) / 3, y0 + (y1 - y0) / 3],
+                [x1 - (x1 - x0) / 3, y1 - (y1 - y0) / 3],
+                [x1, y1],
+            ]
+        points = []
+        for i in range(n - 1):
+            p0, p1 = anchors[i], anchors[i + 1]
+            if i == 0:
+                t0 = [p1[0] - p0[0], p1[1] - p0[1]]
+            else:
+                t0 = [(anchors[i + 1][0] - anchors[i - 1][0]) / 2,
+                       (anchors[i + 1][1] - anchors[i - 1][1]) / 2]
+            if i == n - 2:
+                t1 = [p1[0] - p0[0], p1[1] - p0[1]]
+            else:
+                t1 = [(anchors[i + 2][0] - anchors[i][0]) / 2,
+                       (anchors[i + 2][1] - anchors[i][1]) / 2]
+            cp1 = [p0[0] + t0[0] / 3, p0[1] + t0[1] / 3]
+            cp2 = [p1[0] - t1[0] / 3, p1[1] - t1[1] / 3]
+            if i == 0:
+                points.append([p0[0], p0[1]])
+            points.extend([cp1, cp2, [p1[0], p1[1]]])
+        return points
+
+    @staticmethod
+    def _cubic_bezier(p0, p1, p2, p3, t):
+        u = 1 - t
+        x = u*u*u*p0[0] + 3*u*u*t*p1[0] + 3*u*t*t*p2[0] + t*t*t*p3[0]
+        y = u*u*u*p0[1] + 3*u*u*t*p1[1] + 3*u*t*t*p2[1] + t*t*t*p3[1]
+        return x, y
+
+    @staticmethod
+    def _eval_bezier_at_x(points, x):
+        n = len(points)
+        if n < 2:
+            return points[0][1] if n == 1 else 1.0
+        if n < 4:
+            x0, y0 = points[0]
+            x1, y1 = points[-1]
+            if abs(x1 - x0) < 1e-9:
+                return y0
+            frac = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+            return max(0.0, min(1.0, y0 + (y1 - y0) * frac))
+
+        num_segments = (n - 1) // 3
+        for seg in range(num_segments):
+            idx = seg * 3
+            p0, p1, p2, p3 = points[idx], points[idx+1], points[idx+2], points[idx+3]
+            if x < p0[0] and seg == 0:
+                return max(0.0, min(1.0, p0[1]))
+            if x > p3[0] and seg == num_segments - 1:
+                return max(0.0, min(1.0, p3[1]))
+            if p0[0] <= x <= p3[0] or seg == num_segments - 1:
+                lo, hi = 0.0, 1.0
+                for _ in range(20):
+                    mid = (lo + hi) / 2
+                    bx, _ = AlphaCurveBlend._cubic_bezier(p0, p1, p2, p3, mid)
+                    if bx < x:
+                        lo = mid
+                    else:
+                        hi = mid
+                t = (lo + hi) / 2
+                _, y = AlphaCurveBlend._cubic_bezier(p0, p1, p2, p3, t)
+                return max(0.0, min(1.0, y))
+        return max(0.0, min(1.0, points[-1][1]))
