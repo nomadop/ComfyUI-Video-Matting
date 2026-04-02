@@ -214,6 +214,7 @@ const CURVE_WIDTH = 2;
 const POINT_RADIUS = 5;
 const HIT_RADIUS = 8;
 const CURVE_AREA_HEIGHT = 180;
+const PREVIEW_HEIGHT = 200;
 const PADDING = { top: 15, right: 15, bottom: 25, left: 35 };
 const SAMPLE_COUNT = 200;
 
@@ -261,7 +262,6 @@ app.registerExtension({
             this._rebuildPreviewModeButtons();
 
             // Preview canvas
-            const PREVIEW_HEIGHT = 120;
             const previewCanvas = document.createElement("canvas");
             previewCanvas.style.cssText = `
                 width: 100%; height: ${PREVIEW_HEIGHT}px; flex-shrink: 0;
@@ -397,6 +397,14 @@ app.registerExtension({
             };
             this.curveWidget = widget;
             this.setSize([340, CONTENT_HEIGHT + 100]);
+
+            // Hide the curve_data widget (data-only, synced by _syncCurveData)
+            const cdWidget = this.widgets?.find(w => w.name === "curve_data");
+            if (cdWidget) {
+                cdWidget.type = "converted-widget";
+                cdWidget.computeSize = () => [0, -4];
+                cdWidget.hidden = true;
+            }
 
             // ── Mouse events for curve canvas ────────────────────
             curveCanvas.addEventListener("mousedown", (e) => this._onMouseDown(e));
@@ -599,7 +607,7 @@ app.registerExtension({
             const { w, h } = this.previewSize;
             const dpr = window.devicePixelRatio || 1;
             const pNewW = Math.round(this.previewCanvas.clientWidth * dpr);
-            const pNewH = Math.round(120 * dpr);
+            const pNewH = Math.round(PREVIEW_HEIGHT * dpr);
             if (this.previewCanvas.width !== pNewW || this.previewCanvas.height !== pNewH) {
                 this.previewCanvas.width = pNewW;
                 this.previewCanvas.height = pNewH;
@@ -608,7 +616,7 @@ app.registerExtension({
             pCtx.save();
             pCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
             const dispW = this.previewCanvas.clientWidth;
-            const dispH = 120;
+            const dispH = PREVIEW_HEIGHT;
             const scale = Math.min(dispW / w, dispH / h);
             const dx = (dispW - w * scale) / 2;
             const dy = (dispH - h * scale) / 2;

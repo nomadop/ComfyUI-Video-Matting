@@ -3,11 +3,12 @@ Output Nodes
 
 - ApplyAlpha: Apply alpha to images for final output
 - FrameSelector: Select single frame from batch for efficient preview
-- PreviewSlider: Preview sequence with slider (no re-run needed)
+- PreviewSlider: Preview sequence with slider + mask editing via built-in mask editor
 - ImageSequencePackager: Pack image sequence to ZIP for download
 """
 
 import os
+import json
 import random
 import zipfile
 import time
@@ -163,22 +164,30 @@ class FrameSelector:
 
 
 class PreviewSlider:
-    """Preview image/mask sequence with slider - no re-run needed to scrub frames
+    """Preview image/mask sequence with slider + interactive mask editing.
 
-    Saves all frames to temp, frontend slider controls which frame to display.
-    Much more efficient than gallery mode for long sequences.
+    Saves frames as RGBA temp PNGs with mask editor alpha convention
+    (alpha=0 → masked/foreground, alpha=255 → not masked/background).
+    Frontend provides:
+    - Slider scrubbing with overlay preview (click to toggle B&W mask)
+    - Edit Mask button opens ComfyUI's built-in mask editor per frame
+    - Edited masks output as MASK tensor for downstream use
     """
 
     def __init__(self):
         self.output_dir = folder_paths.get_temp_directory()
         self.type = "temp"
-        self.prefix = "_slider_" + ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
+        self.prefix = "_slider_" + ''.join(
+            random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5)
+        )
         self.compress_level = 4
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {},
+            "required": {
+                "edited_masks": ("STRING", {"default": "{}", "multiline": False}),
+            },
             "optional": {
                 "images": ("IMAGE",),
                 "mask": ("MASK",),
@@ -189,64 +198,125 @@ class PreviewSlider:
             },
         }
 
-    RETURN_TYPES = ()
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("edited_mask",)
     FUNCTION = "preview"
     OUTPUT_NODE = True
     CATEGORY = "Video Matting/Debug"
 
-    def preview(self, images=None, mask=None, prompt=None, extra_pnginfo=None):
-        """Save all frames and return paths for slider preview
+    def preview(self, edited_masks="{}", images=None, mask=None, prompt=None,
+                extra_pnginfo=None):
+        if images is None and mask is None:
+            return {"ui": {"frames": []}, "result": (torch.zeros(1, 64, 64),)}
 
-        Args:
-            images: optional [B, H, W, C] tensor
-            mask: optional [B, H, W] tensor
+        has_images = images is not None
+        has_mask = mask is not None
 
-        Returns:
-            UI dict with all frame paths
-        """
+        if has_images:
+            B, H, W, _ = images.shape
+        else:
+            B, H, W = mask.shape
+
+        # Validate shapes match if both provided
+        if has_images and has_mask:
+            if mask.shape[0] != B:
+                raise ValueError(
+                    f"mask has {mask.shape[0]} frames, expected {B} (same as images)"
+                )
+            if mask.shape[1:] != (H, W):
+                raise ValueError(
+                    f"mask spatial size {mask.shape[1:]} does not match images ({H}, {W})"
+                )
+
+        # Save temp PNGs
         frames = []
+        pbar = comfy.utils.ProgressBar(B)
+        for i in range(B):
+            if has_images and has_mask:
+                # RGBA: RGB=image, A=inverted mask (mask editor convention:
+                # alpha=255 means "not masked", alpha=0 means "masked")
+                rgb = np.clip(images[i].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                a = np.clip(mask[i].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                rgba = np.dstack([rgb, 255 - a])
+                img = Image.fromarray(rgba, 'RGBA')
+            elif has_images:
+                # RGB only (no mask yet — fully opaque = "not masked")
+                rgb = np.clip(images[i].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                img = Image.fromarray(rgb, 'RGB')
+            else:
+                # Mask only: checkerboard background for mask editor visibility
+                a = np.clip(mask[i].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+                sq = 16
+                yy, xx = np.mgrid[:H, :W]
+                checker = np.where(((yy // sq) + (xx // sq)) % 2 == 0, 180, 220)
+                bg = np.stack([checker, checker, checker], axis=-1).astype(np.uint8)
+                rgba = np.dstack([bg, 255 - a])
+                img = Image.fromarray(rgba, 'RGBA')
 
-        # Process images
-        if images is not None:
-            b, h, w, c = images.shape
-            pbar = comfy.utils.ProgressBar(b)
-            for i in range(b):
-                frame = images[i].cpu().numpy()
-                img = Image.fromarray(np.clip(frame * 255, 0, 255).astype(np.uint8))
+            filename = f"ps{self.prefix}_{i:05d}.png"
+            filepath = os.path.join(self.output_dir, filename)
+            img.save(filepath, compress_level=self.compress_level)
 
-                filename = f"img{self.prefix}_{i:05d}.png"
-                filepath = os.path.join(self.output_dir, filename)
-                img.save(filepath, compress_level=self.compress_level)
+            frames.append({
+                "filename": filename,
+                "subfolder": "",
+                "type": self.type,
+            })
+            pbar.update(1)
 
-                frames.append({
-                    "filename": filename,
-                    "subfolder": "",
-                    "type": self.type
-                })
-                pbar.update(1)
+        # Build output MASK tensor
+        edited = {}
+        try:
+            edited = json.loads(edited_masks) if edited_masks else {}
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        # Process mask (if no images provided)
-        elif mask is not None:
-            b, h, w = mask.shape
-            pbar = comfy.utils.ProgressBar(b)
-            for i in range(b):
-                frame = mask[i].cpu().numpy()
-                mask_uint8 = np.clip(frame * 255, 0, 255).astype(np.uint8)
-                img = Image.fromarray(mask_uint8, mode='L').convert('RGB')
+        result_mask = []
+        for i in range(B):
+            if str(i) in edited:
+                # Load edited mask file (may be in input/clipspace or temp)
+                ref = edited[str(i)]
+                ref_type = ref.get("type", "input")
+                base_dir = folder_paths.get_directory_by_type(ref_type)
+                if base_dir is None:
+                    base_dir = folder_paths.get_input_directory()
+                mask_path = os.path.join(
+                    base_dir,
+                    ref.get("subfolder", ""),
+                    ref["filename"],
+                )
+                try:
+                    with Image.open(mask_path) as mask_img:
+                        if mask_img.mode == 'RGBA':
+                            alpha = np.array(mask_img.getchannel('A'))
+                        elif mask_img.mode == 'L':
+                            alpha = np.array(mask_img)
+                        else:
+                            alpha = np.array(mask_img.convert('L'))
+                        # Invert: mask editor convention (0=masked) → matting (1.0=foreground)
+                        alpha_t = 1.0 - torch.from_numpy(alpha.astype(np.float32) / 255.0)
+                        result_mask.append(alpha_t)
+                except (FileNotFoundError, OSError):
+                    # Fallback if edited file missing
+                    if has_mask:
+                        result_mask.append(mask[i].cpu())
+                    else:
+                        result_mask.append(torch.ones(H, W))
+            elif has_mask:
+                result_mask.append(mask[i].cpu())
+            else:
+                result_mask.append(torch.ones(H, W))
 
-                filename = f"mask{self.prefix}_{i:05d}.png"
-                filepath = os.path.join(self.output_dir, filename)
-                img.save(filepath, compress_level=self.compress_level)
+        mask_tensor = torch.stack(result_mask, dim=0)
 
-                frames.append({
-                    "filename": filename,
-                    "subfolder": "",
-                    "type": self.type
-                })
-                pbar.update(1)
-
-        # Return only frames for slider (no images to avoid default preview)
-        return {"ui": {"frames": frames}}
+        return {
+            "ui": {
+                "frames": frames,
+                "has_images": [has_images],
+                "has_mask": [has_mask],
+            },
+            "result": (mask_tensor,),
+        }
 
 
 class ImageSequencePackager:
