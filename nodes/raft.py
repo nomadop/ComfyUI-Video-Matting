@@ -2,6 +2,7 @@
 RAFT Optical Flow + Alpha Deflicker Nodes
 
 - RAFTLoader: Load TorchVision RAFT model
+- OpticalFlowComputer: Compute bidirectional optical flow for downstream use
 - AlphaDeflicker: Temporal smoothing of alpha using optical flow warping
 """
 
@@ -70,6 +71,117 @@ class RAFTLoader:
         print(f"RAFT loaded on {device}" + (" (FP16)" if use_fp16 else ""))
 
         return ({"model": model, "device": device, "use_fp16": use_fp16},)
+
+
+class OpticalFlowComputer:
+    """Compute bidirectional optical flow from video frames.
+
+    Outputs OPTICAL_FLOW dict containing forward/backward flow tensors
+    and metadata. Can be consumed by AlphaCurveBlend (attention waveform)
+    or any node needing motion information.
+    """
+
+    MODEL_OPTIONS = ["raft_small", "raft_large"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "model": (cls.MODEL_OPTIONS, {"default": "raft_large",
+                          "tooltip": "raft_small is 3-4x faster, raft_large is more accurate (recommended)"}),
+                "resolution": ("INT", {"default": 512, "min": 256, "max": 1024, "step": 128,
+                                "tooltip": "Flow computation resolution (longer edge). Higher = more accurate but slower"}),
+            },
+        }
+
+    RETURN_TYPES = ("OPTICAL_FLOW",)
+    RETURN_NAMES = ("optical_flow",)
+    FUNCTION = "compute"
+    CATEGORY = "Video Matting"
+
+    def compute(self, images, model="raft_small", resolution=512):
+        device = _get_device()
+
+        # Load RAFT model with transforms
+        if model == "raft_small":
+            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+            weights = Raft_Small_Weights.DEFAULT
+            raft = raft_small(weights=weights)
+        else:
+            from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+            weights = Raft_Large_Weights.DEFAULT
+            raft = raft_large(weights=weights)
+
+        raft = raft.to(device).eval()
+        raft_transforms = weights.transforms()
+
+        B, H, W, C = images.shape
+        if B < 2:
+            raise ValueError("Need at least 2 frames for optical flow")
+
+        # Convert images: [B, 3, H, W] uint8 [0, 255] for RAFT transforms
+        frames = (images.permute(0, 3, 1, 2) * 255.0).to(torch.uint8)
+
+        # Downscale for RAFT if needed
+        if max(H, W) > resolution:
+            scale = resolution / max(H, W)
+            new_h = int(H * scale) // 8 * 8
+            new_w = int(W * scale) // 8 * 8
+        else:
+            new_h = H // 8 * 8
+            new_w = W // 8 * 8
+
+        raft_frames = F.interpolate(frames.float(), size=(new_h, new_w),
+                                    mode='bilinear', align_corners=False).to(torch.uint8)
+
+        # Compute bidirectional flow
+        num_pairs = B - 1
+        fwd_flows = []
+        bwd_flows = []
+
+        pbar = comfy.utils.ProgressBar(num_pairs * 2)
+        with torch.no_grad():
+            for i in range(num_pairs):
+                # Apply transforms (normalizes uint8 → float, may resize)
+                img1, img2 = raft_transforms(raft_frames[i:i+1], raft_frames[i+1:i+2])
+                img1, img2 = img1.to(device), img2.to(device)
+
+                # Forward: frame i → frame i+1
+                fwd = raft(img1, img2, num_flow_updates=12)[-1]
+                fwd_flows.append(fwd.cpu())
+                pbar.update(1)
+
+                # Backward: frame i+1 → frame i
+                bwd = raft(img2, img1, num_flow_updates=12)[-1]
+                bwd_flows.append(bwd.cpu())
+                pbar.update(1)
+
+        # Free GPU memory
+        del raft, raft_frames, frames
+        if device.type in ('cuda', 'mps'):
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
+
+        fwd_flow = torch.cat(fwd_flows, dim=0)  # [B-1, 2, H', W']
+        bwd_flow = torch.cat(bwd_flows, dim=0)
+
+        # Use actual output dimensions (transforms may resize)
+        actual_h = fwd_flow.shape[2]
+        actual_w = fwd_flow.shape[3]
+
+        print(f"OpticalFlow: {num_pairs} pairs computed at {actual_w}x{actual_h} "
+              f"using {model}")
+
+        return ({
+            "fwd": fwd_flow,
+            "bwd": bwd_flow,
+            "resolution": resolution,
+            "flow_h": actual_h,
+            "flow_w": actual_w,
+            "orig_h": H,
+            "orig_w": W,
+            "model": model,
+        },)
 
 
 class AlphaDeflicker:

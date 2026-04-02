@@ -125,10 +125,7 @@ app.registerExtension({
                 const idx = parseInt(slider.value);
                 this.currentFrame = idx;
                 this.frameInput.value = idx;
-                clearTimeout(this._sliderDebounce);
-                this._sliderDebounce = setTimeout(() => {
-                    this.updatePreview(idx);
-                }, 80);
+                this.updatePreview(idx);
             });
             sliderRow.appendChild(slider);
             this.slider = slider;
@@ -228,6 +225,7 @@ app.registerExtension({
                 this.hasMask = message.has_mask?.[0] ?? false;
                 this.updateSlider();
                 this.updatePreview(Math.min(this.currentFrame, this.totalFrames - 1));
+                this._buildPreviewCache();
             }
         };
 
@@ -246,6 +244,14 @@ app.registerExtension({
             this.currentFrame = frameIndex;
             this.frameInput.value = frameIndex;
             this.slider.value = frameIndex;
+
+            // Try cache first
+            const cacheKey = this._showMaskBW ? "bw" : "main";
+            const cache = this._previewCache?.[cacheKey];
+            if (cache?.[frameIndex]) {
+                this._drawToCanvas(cache[frameIndex]);
+                return;
+            }
 
             // Bump generation to discard any in-flight renders
             const gen = ++this._renderGen;
@@ -358,19 +364,131 @@ app.registerExtension({
             const sh = source.naturalHeight || source.height;
             if (!sw || !sh) return;
 
-            // Fit to container
+            // Fit to container, accounting for device pixel ratio
             const container = this.imgContainer;
             const maxW = container.clientWidth || 280;
             const maxH = container.clientHeight || 200;
             const scale = Math.min(maxW / sw, maxH / sh, 1);
             const dw = Math.round(sw * scale);
             const dh = Math.round(sh * scale);
+            const dpr = window.devicePixelRatio || 1;
 
-            this.previewCanvas.width = dw;
-            this.previewCanvas.height = dh;
+            this.previewCanvas.width = Math.round(dw * dpr);
+            this.previewCanvas.height = Math.round(dh * dpr);
             this.previewCanvas.style.width = dw + "px";
             this.previewCanvas.style.height = dh + "px";
+            this.previewCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
             this.previewCtx.drawImage(source, 0, 0, dw, dh);
+            this.previewCtx.setTransform(1, 0, 0, 1, 0, 0);
+        };
+
+        // ── Preview cache ─────────────────────────────────────────────────
+        nodeType.prototype._buildPreviewCache = function () {
+            this._previewCache = { main: new Array(this.totalFrames), bw: new Array(this.totalFrames) };
+            for (let i = 0; i < this.totalFrames; i++) {
+                this._cacheFrame(i);
+            }
+        };
+
+        nodeType.prototype._cacheFrame = function (frameIndex) {
+            const cache = this._previewCache;
+            if (!cache) return;
+
+            const edited = this.editedMasks.has(frameIndex);
+            const frame = edited ? this.editedMasks.get(frameIndex) : this.frames[frameIndex];
+            const needsOverlay = this.hasMask || edited;
+
+            if (needsOverlay) {
+                // Cache both modes: overlay (main) and B&W mask (bw)
+                const rgbURL = viewURL(frame, "rgb");
+                const alphaURL = viewURL(frame, "a");
+
+                Promise.all([loadImage(rgbURL), loadImage(alphaURL)]).then(([rgbImg, aImg]) => {
+                    const w = rgbImg.naturalWidth;
+                    const h = rgbImg.naturalHeight;
+
+                    // Extract alpha data once
+                    const aTmp = document.createElement("canvas");
+                    aTmp.width = w;
+                    aTmp.height = h;
+                    const aCtx = aTmp.getContext("2d");
+                    aCtx.drawImage(aImg, 0, 0);
+                    const aData = aCtx.getImageData(0, 0, w, h).data;
+
+                    // Main mode: RGB + dark overlay
+                    const mainCanvas = document.createElement("canvas");
+                    mainCanvas.width = w;
+                    mainCanvas.height = h;
+                    const mainCtx = mainCanvas.getContext("2d");
+                    mainCtx.drawImage(rgbImg, 0, 0);
+                    const overlay = mainCtx.createImageData(w, h);
+                    for (let i = 0; i < aData.length; i += 4) {
+                        const a = aData[i + 3];
+                        if (a < 255) {
+                            overlay.data[i + 3] = Math.round((255 - a) * 0.75);
+                        }
+                    }
+                    const oTmp = document.createElement("canvas");
+                    oTmp.width = w;
+                    oTmp.height = h;
+                    oTmp.getContext("2d").putImageData(overlay, 0, 0);
+                    mainCtx.drawImage(oTmp, 0, 0);
+                    if (cache.main) cache.main[frameIndex] = mainCanvas;
+
+                    // BW mode: inverted alpha as grayscale
+                    const bwCanvas = document.createElement("canvas");
+                    bwCanvas.width = w;
+                    bwCanvas.height = h;
+                    const bwCtx = bwCanvas.getContext("2d");
+                    const bwData = bwCtx.createImageData(w, h);
+                    for (let i = 0; i < aData.length; i += 4) {
+                        const v = 255 - aData[i + 3];
+                        bwData.data[i] = v;
+                        bwData.data[i + 1] = v;
+                        bwData.data[i + 2] = v;
+                        bwData.data[i + 3] = 255;
+                    }
+                    bwCtx.putImageData(bwData, 0, 0);
+                    if (cache.bw) cache.bw[frameIndex] = bwCanvas;
+
+                    // Refresh display if this is the current frame
+                    if (frameIndex === this.currentFrame) this.updatePreview(frameIndex);
+                }).catch(() => {});
+            } else if (this.hasImages) {
+                // Simple RGB
+                loadImage(viewURL(frame, "rgb")).then(img => {
+                    const c = document.createElement("canvas");
+                    c.width = img.naturalWidth;
+                    c.height = img.naturalHeight;
+                    c.getContext("2d").drawImage(img, 0, 0);
+                    if (cache.main) cache.main[frameIndex] = c;
+                    if (cache.bw) cache.bw[frameIndex] = c;
+                    if (frameIndex === this.currentFrame) this.updatePreview(frameIndex);
+                }).catch(() => {});
+            } else {
+                // Mask only (no RGB)
+                loadImage(viewURL(frame, "a")).then(img => {
+                    const w = img.naturalWidth;
+                    const h = img.naturalHeight;
+                    const c = document.createElement("canvas");
+                    c.width = w;
+                    c.height = h;
+                    const ctx = c.getContext("2d");
+                    ctx.drawImage(img, 0, 0);
+                    const data = ctx.getImageData(0, 0, w, h);
+                    for (let i = 0; i < data.data.length; i += 4) {
+                        const v = 255 - data.data[i + 3];
+                        data.data[i] = v;
+                        data.data[i + 1] = v;
+                        data.data[i + 2] = v;
+                        data.data[i + 3] = 255;
+                    }
+                    ctx.putImageData(data, 0, 0);
+                    if (cache.main) cache.main[frameIndex] = c;
+                    if (cache.bw) cache.bw[frameIndex] = c;
+                    if (frameIndex === this.currentFrame) this.updatePreview(frameIndex);
+                }).catch(() => {});
+            }
         };
 
         // ── openMaskEditor ─────────────────────────────────────────────────
@@ -446,6 +564,13 @@ app.registerExtension({
             });
             this._syncEditedMasks();
             this._updateEditedIndicator();
+
+            // Invalidate + rebuild cache for this frame
+            if (this._previewCache) {
+                if (this._previewCache.main) this._previewCache.main[frameIndex] = null;
+                if (this._previewCache.bw) this._previewCache.bw[frameIndex] = null;
+                this._cacheFrame(frameIndex);
+            }
             this.updatePreview(frameIndex);
         };
 
@@ -492,6 +617,7 @@ app.registerExtension({
             this.editedMasks.clear();
             this._syncEditedMasks();
             this._updateEditedIndicator();
+            this._buildPreviewCache();
             this.updatePreview(this.currentFrame);
         };
     },

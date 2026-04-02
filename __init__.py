@@ -34,7 +34,7 @@ from .nodes.cutie import CutieProcess
 from .nodes.vitmatte import ViTMatteRefine, TrimapVisualize
 from .nodes.alpha_ops import AlphaCombine, TwoPassBlend, MaskToGrayscaleImage, AlphaCurveBlend
 from .nodes.output import ApplyAlpha, FrameSelector, PreviewSlider, ImageSequencePackager
-from .nodes.raft import RAFTLoader, AlphaDeflicker
+from .nodes.raft import RAFTLoader, OpticalFlowComputer, AlphaDeflicker
 from .nodes.flickerformer import FlickerformerLoader, FlickerformerDeflicker
 
 NODE_CLASS_MAPPINGS = {
@@ -67,6 +67,7 @@ NODE_CLASS_MAPPINGS = {
     "ImageSequencePackager": ImageSequencePackager,
     # Optical Flow
     "RAFTLoader": RAFTLoader,
+    "OpticalFlowComputer": OpticalFlowComputer,
     "AlphaDeflicker": AlphaDeflicker,
     # Flickerformer
     "FlickerformerLoader": FlickerformerLoader,
@@ -103,6 +104,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageSequencePackager": "Image Sequence Packager",
     # Optical Flow
     "RAFTLoader": "RAFT Loader",
+    "OpticalFlowComputer": "Optical Flow Computer",
     "AlphaDeflicker": "Alpha Deflicker",
     # Flickerformer
     "FlickerformerLoader": "Flickerformer Loader",

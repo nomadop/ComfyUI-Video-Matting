@@ -192,18 +192,9 @@ function evalAnchorsAtX(anchors, x, mode) {
     }
 }
 
-// ── Color helper ────────────────────────────────────────────────────────────
-
-function parseHexColor(hex) {
-    const r = parseInt(hex.slice(1, 3), 16) / 255;
-    const g = parseInt(hex.slice(3, 5), 16) / 255;
-    const b = parseInt(hex.slice(5, 7), 16) / 255;
-    return { r, g, b };
-}
-
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const PREVIEW_MODES = ["colorize", "blend", "source"];
+const PREVIEW_MODES = ["blend", "source"];
 const COLORS = {
     a: "#4CAF50",
     b: "#2196F3",
@@ -217,6 +208,11 @@ const CURVE_AREA_HEIGHT = 180;
 const PREVIEW_HEIGHT = 200;
 const PADDING = { top: 15, right: 15, bottom: 25, left: 35 };
 const SAMPLE_COUNT = 200;
+const ATTENTION_CACHE_SIZE = 256;
+const ATTENTION_Y_FLOOR = 0.03;
+const ATTENTION_WAVE_RATIO = 1;
+const ATTENTION_DIV_COLOR = "rgba(200, 60, 40, 0.3)";
+const ATTENTION_DIV_THRESH = 0.003;
 
 // ── Extension ────────────────────────────────────────────────────────────────
 
@@ -237,13 +233,21 @@ app.registerExtension({
             }];
             this.activeCurveId = "a";
             this.interpMode = "catmull-rom";
-            this.previewMode = "colorize";
+            this.previewMode = "blend";
             this.frameCache = {};
             this.totalFrames = 0;
             this.currentFrame = 0;
             this.dragging = null;
             this.previewSize = { w: 0, h: 0 };
             this.anchorOffset = 5;
+
+            // Attention waveform state
+            this._pixelCache = null;
+            this._divergenceScores = null;
+            this._attentionDiv = null;
+            this._attentionDivYMax = ATTENTION_Y_FLOOR;
+            this._flowCache = null;   // { fwd: [{dx,dy},...], bwd: [{dx,dy},...] }
+            this._flowMeta = null;    // { flow_h, flow_w }
 
             // ── DOM structure ────────────────────────────────────
             const container = document.createElement("div");
@@ -268,6 +272,11 @@ app.registerExtension({
                 background: #1a1a1a; border-radius: 4px;
             `;
             previewCanvas.height = PREVIEW_HEIGHT;
+            previewCanvas.style.cursor = "pointer";
+            previewCanvas.addEventListener("click", () => {
+                this._rebuildBlendCache();
+                this._renderBlendedFrame();
+            });
             container.appendChild(previewCanvas);
             this.previewCanvas = previewCanvas;
             this.previewCtx = previewCanvas.getContext("2d");
@@ -464,6 +473,21 @@ app.registerExtension({
                 this.frameInput.value = 0;
                 this.frameLabel.textContent = `/ ${Math.max(0, this.totalFrames - 1)}`;
                 this._preloadFrames(sourceFrames);
+
+                // Load optical flow data if present
+                const flowData = message?.optical_flow?.[0];
+                if (flowData) {
+                    this._flowMeta = {
+                        flow_h: flowData.flow_h,
+                        flow_w: flowData.flow_w,
+                    };
+                    this._preloadFlow(flowData);
+                } else {
+                    this._flowCache = null;
+                    this._flowMeta = null;
+                }
+
+                this._buildPixelCache();
             }
         };
 
@@ -518,13 +542,10 @@ app.registerExtension({
         };
 
         nodeType.prototype._renderBlendedFrame = function () {
-            const { w, h } = this.previewSize;
-            if (w === 0 || h === 0 || this.totalFrames === 0) return;
-
-            const mode = this.previewMode;
+            if (this.totalFrames === 0) return;
 
             // Source mode: just draw the active source frame directly
-            if (mode === "source") {
+            if (this.previewMode === "source") {
                 const cache = this.frameCache[this.activeCurveId];
                 const img = cache?.[this.currentFrame];
                 if (!img || !img.complete || img.naturalWidth === 0) return;
@@ -532,10 +553,21 @@ app.registerExtension({
                 return;
             }
 
-            // Blend / Colorize modes need weights + pixel data
-            const t = this.totalFrames > 1
-                ? this.currentFrame / (this.totalFrames - 1)
-                : 0;
+            // Use precomputed blend cache if available
+            if (this._blendCache) {
+                const cached = this._blendCache[this.currentFrame];
+                if (cached) { this._drawToPreview(cached); return; }
+            }
+
+            // Fallback: compute single frame (before cache is ready)
+            this._renderSingleFrame(this.currentFrame);
+        };
+
+        nodeType.prototype._renderSingleFrame = function (frameIdx) {
+            const { w, h } = this.previewSize;
+            if (w === 0 || h === 0) return;
+
+            const t = this.totalFrames > 1 ? frameIdx / (this.totalFrames - 1) : 0;
 
             const weights = {};
             let weightSum = 0;
@@ -549,7 +581,7 @@ app.registerExtension({
             const pixelArrays = {};
             for (const [id, cache] of Object.entries(this.frameCache)) {
                 if (weights[id] === undefined || weights[id] === 0) continue;
-                const img = cache[this.currentFrame];
+                const img = cache[frameIdx];
                 if (!img || !img.complete || img.naturalWidth === 0) continue;
                 this.tmpCtx.drawImage(img, 0, 0, w, h);
                 pixelArrays[id] = this.tmpCtx.getImageData(0, 0, w, h).data;
@@ -561,46 +593,105 @@ app.registerExtension({
             const out = this.previewCtx.createImageData(w, h);
             const len = out.data.length;
 
-            if (mode === "colorize") {
-                // Active source tinted with curve color, others grayscale
-                const activeId = this.activeCurveId;
-                const activeCurve = this.curves.find(c => c.id === activeId);
-                const tint = activeCurve ? parseHexColor(activeCurve.color) : { r: 1, g: 1, b: 1 };
-
-                for (let i = 0; i < len; i += 4) {
-                    let activeWeighted = 0;
-                    let otherWeighted = 0;
-                    for (const id of ids) {
-                        const contrib = (pixelArrays[id][i] / 255) * weights[id];
-                        if (id === activeId) activeWeighted = contrib;
-                        else otherWeighted += contrib;
-                    }
-                    const aw = activeWeighted / weightSum;
-                    const ow = otherWeighted / weightSum;
-                    out.data[i]     = Math.round(Math.min(1, aw * tint.r + ow) * 255);
-                    out.data[i + 1] = Math.round(Math.min(1, aw * tint.g + ow) * 255);
-                    out.data[i + 2] = Math.round(Math.min(1, aw * tint.b + ow) * 255);
-                    out.data[i + 3] = 255;
+            for (let i = 0; i < len; i += 4) {
+                let val = 0;
+                for (const id of ids) {
+                    val += pixelArrays[id][i] * weights[id];
                 }
-            } else {
-                // Blend: pure grayscale
-                for (let i = 0; i < len; i += 4) {
-                    let val = 0;
-                    for (const id of ids) {
-                        val += pixelArrays[id][i] * weights[id];
-                    }
-                    val = Math.round(val / weightSum);
-                    out.data[i] = out.data[i+1] = out.data[i+2] = val;
-                    out.data[i+3] = 255;
-                }
+                val = Math.round(val / weightSum);
+                out.data[i] = out.data[i+1] = out.data[i+2] = val;
+                out.data[i+3] = 255;
             }
 
-            // Put image data to temp canvas, then scale to preview
             const tmpOut = document.createElement("canvas");
             tmpOut.width = w;
             tmpOut.height = h;
             tmpOut.getContext("2d").putImageData(out, 0, 0);
             this._drawToPreview(tmpOut);
+        };
+
+        nodeType.prototype._rebuildBlendCache = function () {
+            this._blendCache = null;
+            const { w, h } = this.previewSize;
+            if (w === 0 || h === 0 || this.totalFrames === 0) return;
+            if (this.previewMode === "source") return;
+
+            const sourceIds = Object.keys(this.frameCache);
+            if (sourceIds.length === 0) return;
+
+            // Determine cache resolution (fit within preview display size)
+            const dispW = this.previewCanvas.clientWidth || 400;
+            const dispH = PREVIEW_HEIGHT;
+            const scale = Math.min(dispW / w, dispH / h, 1);
+            const cw = Math.round(w * scale);
+            const ch = Math.round(h * scale);
+
+            // Build source pixel cache at cache resolution
+            const srcCanvas = document.createElement("canvas");
+            srcCanvas.width = cw;
+            srcCanvas.height = ch;
+            const srcCtx = srcCanvas.getContext("2d", { willReadFrequently: true });
+
+            const srcPixels = {};  // { sourceId: [ Uint8Array(grayscale), ... ] }
+            for (const id of sourceIds) {
+                const frames = this.frameCache[id];
+                srcPixels[id] = new Array(this.totalFrames);
+                for (let i = 0; i < this.totalFrames; i++) {
+                    const img = frames[i];
+                    if (!img || !img.complete || img.naturalWidth === 0) continue;
+                    srcCtx.clearRect(0, 0, cw, ch);
+                    srcCtx.drawImage(img, 0, 0, cw, ch);
+                    const data = srcCtx.getImageData(0, 0, cw, ch).data;
+                    // Store only R channel (grayscale masks)
+                    const gray = new Uint8Array(cw * ch);
+                    for (let p = 0; p < gray.length; p++) gray[p] = data[p * 4];
+                    srcPixels[id][i] = gray;
+                }
+            }
+
+            // Precompute blended frames
+            const blendCache = new Array(this.totalFrames);
+            const outCanvas = document.createElement("canvas");
+            outCanvas.width = cw;
+            outCanvas.height = ch;
+            const outCtx = outCanvas.getContext("2d");
+
+            for (let fi = 0; fi < this.totalFrames; fi++) {
+                const t = this.totalFrames > 1 ? fi / (this.totalFrames - 1) : 0;
+
+                const weights = {};
+                let weightSum = 0;
+                for (const curve of this.curves) {
+                    const cWeight = Math.max(0, evalAnchorsAtX(curve.anchors, t, this.interpMode));
+                    weights[curve.id] = cWeight;
+                    weightSum += cWeight;
+                }
+                if (weightSum === 0) weightSum = 1;
+
+                const out = outCtx.createImageData(cw, ch);
+                const pixels = cw * ch;
+
+                for (let p = 0; p < pixels; p++) {
+                    let val = 0;
+                    for (const id of sourceIds) {
+                        const px = srcPixels[id][fi];
+                        if (!px || weights[id] === undefined) continue;
+                        val += px[p] * weights[id];
+                    }
+                    val = Math.round(val / weightSum);
+                    const idx = p * 4;
+                    out.data[idx] = out.data[idx + 1] = out.data[idx + 2] = val;
+                    out.data[idx + 3] = 255;
+                }
+
+                const frameCanvas = document.createElement("canvas");
+                frameCanvas.width = cw;
+                frameCanvas.height = ch;
+                frameCanvas.getContext("2d").putImageData(out, 0, 0);
+                blendCache[fi] = frameCanvas;
+            }
+
+            this._blendCache = blendCache;
         };
 
         nodeType.prototype._drawToPreview = function (source) {
@@ -629,6 +720,7 @@ app.registerExtension({
         // ── Curve drawing ───────────────────────────────────────
 
         nodeType.prototype._drawCurves = function () {
+
             const canvas = this.curveCanvas;
             const dpr = window.devicePixelRatio || 1;
             const dispW = canvas.clientWidth;
@@ -669,6 +761,9 @@ app.registerExtension({
                 ctx.lineTo(x, PADDING.top + areaH);
                 ctx.stroke();
             }
+
+            // Attention waveform (behind everything else)
+            this._drawAttentionWaveform(ctx, areaW, areaH);
 
             // Axis labels
             ctx.fillStyle = "#666";
@@ -876,7 +971,9 @@ app.registerExtension({
                 this._dragInitialAnchors = null;
                 this.curveCanvas.style.cursor = "default";
                 this._syncCurveData();
+
                 this._drawCurves();
+                this._renderBlendedFrame();
             }
         };
 
@@ -936,6 +1033,7 @@ app.registerExtension({
             if (idx > 0 && idx < curve.anchors.length - 1 && curve.anchors.length > 2) {
                 curve.anchors.splice(idx, 1);
                 this._syncCurveData();
+
                 this._drawCurves();
                 this._renderBlendedFrame();
             }
@@ -959,6 +1057,7 @@ app.registerExtension({
                 btn.addEventListener("click", () => {
                     this.previewMode = m;
                     this._rebuildPreviewModeButtons();
+    
                     this._renderBlendedFrame();
                 });
                 row.appendChild(btn);
@@ -992,10 +1091,11 @@ app.registerExtension({
                 btn.addEventListener("click", () => {
                     this.activeCurveId = curve.id;
                     this._rebuildLegend();
-                    this._drawCurves();
                     if (this.previewMode !== "blend") {
-                        this._renderBlendedFrame();
+        
                     }
+                    this._drawCurves();
+                    this._renderBlendedFrame();
                 });
                 row.appendChild(btn);
             }
@@ -1021,10 +1121,25 @@ app.registerExtension({
             modeSelect.addEventListener("change", () => {
                 this.interpMode = modeSelect.value;
                 this._syncCurveData();
+
                 this._drawCurves();
                 this._renderBlendedFrame();
             });
             row.appendChild(modeSelect);
+
+            // Auto button
+            const autoBtn = document.createElement("button");
+            autoBtn.style.cssText = `
+                padding: 2px 8px; border: 1px solid #555;
+                border-radius: 3px; background: #2a2a2a; color: #e0a030;
+                font-size: 11px; cursor: pointer; font-weight: bold;
+            `;
+            autoBtn.textContent = "Auto";
+            autoBtn.title = "Auto-optimize blend curves to minimize temporal flicker";
+            autoBtn.addEventListener("click", () => {
+                this._computeOptimalCurves();
+            });
+            row.appendChild(autoBtn);
 
             // Reset button
             const resetBtn = document.createElement("button");
@@ -1039,15 +1154,650 @@ app.registerExtension({
                     curve.anchors = [[0, 1], [1, 1]];
                 }
                 this._syncCurveData();
+
                 this._drawCurves();
                 this._renderBlendedFrame();
             });
             row.appendChild(resetBtn);
         };
 
+        // ── Attention waveform ───────────────────────────────────
+
+        nodeType.prototype._preloadFlow = function (flowData) {
+            this._flowCache = null;
+            const fwdList = flowData.fwd || [];
+            const bwdList = flowData.bwd || [];
+            const N = fwdList.length;
+            if (N === 0) return;
+
+            const cache = { fwd: new Array(N), bwd: new Array(N) };
+            let pending = 0;
+            const total = N * 2;
+            const SIZE = ATTENTION_CACHE_SIZE;
+            const flowH = flowData.flow_h;
+            const flowW = flowData.flow_w;
+
+            const canvas = document.createElement("canvas");
+            canvas.width = flowW;
+            canvas.height = flowH;
+            const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+            // Downscale canvas for resampling to pixelCache size
+            const dsCanvas = document.createElement("canvas");
+            dsCanvas.width = SIZE;
+            dsCanvas.height = SIZE;
+            const dsCtx = dsCanvas.getContext("2d", { willReadFrequently: true });
+
+            const scaleX = SIZE / flowW;
+            const scaleY = SIZE / flowH;
+
+            const onReady = () => {
+                pending++;
+                if (pending < total) return;
+                this._flowCache = cache;
+            };
+
+            const processFlowImg = (img, direction, idx) => {
+                // Draw at flow resolution
+                ctx.clearRect(0, 0, flowW, flowH);
+                ctx.drawImage(img, 0, 0, flowW, flowH);
+
+                // Downsample to pixelCache size
+                dsCtx.clearRect(0, 0, SIZE, SIZE);
+                dsCtx.drawImage(canvas, 0, 0, SIZE, SIZE);
+                const data = dsCtx.getImageData(0, 0, SIZE, SIZE).data;
+
+                // Decode: R = dx + 128, G = dy + 128 → scale vectors
+                const dx = new Float32Array(SIZE * SIZE);
+                const dy = new Float32Array(SIZE * SIZE);
+                for (let p = 0; p < dx.length; p++) {
+                    dx[p] = (data[p * 4] - 128) * scaleX;      // scale flow vectors
+                    dy[p] = (data[p * 4 + 1] - 128) * scaleY;
+                }
+                cache[direction][idx] = { dx, dy };
+                onReady();
+            };
+
+            for (let i = 0; i < N; i++) {
+                for (const [direction, list] of [["fwd", fwdList], ["bwd", bwdList]]) {
+                    const f = list[i];
+                    const img = new Image();
+                    img.crossOrigin = "anonymous";
+                    const dir = direction, idx = i;
+                    img.onload = () => processFlowImg(img, dir, idx);
+                    img.src = api.apiURL(`/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || "")}&type=${f.type || "temp"}`);
+                }
+            }
+        };
+
+        nodeType.prototype._buildPixelCache = function () {
+            this._pixelCache = null;
+            this._divergenceScores = null;
+            this._attentionDiv = null;
+            this._attentionDivYMax = ATTENTION_Y_FLOOR;
+
+            const sourceIds = Object.keys(this.frameCache);
+            if (sourceIds.length === 0 || this.totalFrames === 0) return;
+
+            const SIZE = ATTENTION_CACHE_SIZE;
+            const canvas = document.createElement("canvas");
+            canvas.width = SIZE;
+            canvas.height = SIZE;
+            const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+            const cache = {};
+            let pending = 0;
+            let total = 0;
+
+            for (const id of sourceIds) {
+                const frames = this.frameCache[id];
+                cache[id] = new Array(frames.length);
+                total += frames.length;
+            }
+
+            const onFrameReady = () => {
+                pending++;
+                if (pending < total) return;
+                this._pixelCache = cache;
+                this._computeDivergence();
+                this._computeAttention();
+                this._drawCurves();
+                this._renderBlendedFrame();
+            };
+
+            for (const id of sourceIds) {
+                const frames = this.frameCache[id];
+                for (let i = 0; i < frames.length; i++) {
+                    const img = frames[i];
+                    const processFrame = () => {
+                        ctx.clearRect(0, 0, SIZE, SIZE);
+                        ctx.drawImage(img, 0, 0, SIZE, SIZE);
+                        const data = ctx.getImageData(0, 0, SIZE, SIZE).data;
+                        // Extract grayscale (R channel, since source is grayscale PNG)
+                        const gray = new Uint8Array(SIZE * SIZE);
+                        for (let p = 0; p < gray.length; p++) {
+                            gray[p] = data[p * 4];
+                        }
+                        cache[id][i] = gray;
+                        onFrameReady();
+                    };
+                    if (img.complete && img.naturalWidth > 0) {
+                        processFrame();
+                    } else {
+                        img.addEventListener("load", processFrame, { once: true });
+                    }
+                }
+            }
+        };
+
+        nodeType.prototype._computeDivergence = function () {
+            if (!this._pixelCache) { this._divergenceScores = null; return; }
+            const sourceIds = Object.keys(this._pixelCache);
+            if (sourceIds.length < 2) { this._divergenceScores = null; return; }
+
+            const B = this._pixelCache[sourceIds[0]].length;
+            const SZ = ATTENTION_CACHE_SIZE;
+            const GRID = 8;
+            const BLOCK_SZ = SZ / GRID;
+            const BLOCK_PIXELS = BLOCK_SZ * BLOCK_SZ;
+            const NUM_BLOCKS = GRID * GRID;
+            const TOP_K = 8;
+            const numSrc = sourceIds.length;
+            const scores = new Float32Array(B);
+            const blockScores = new Float32Array(NUM_BLOCKS);
+
+            for (let i = 0; i < B; i++) {
+                // L1: per-block mean std across models
+                for (let by = 0; by < GRID; by++) {
+                    for (let bx = 0; bx < GRID; bx++) {
+                        let sumStd = 0;
+                        const rowStart = by * BLOCK_SZ;
+                        const colStart = bx * BLOCK_SZ;
+                        for (let r = 0; r < BLOCK_SZ; r++) {
+                            const rowOff = (rowStart + r) * SZ + colStart;
+                            for (let c = 0; c < BLOCK_SZ; c++) {
+                                const p = rowOff + c;
+                                let sum = 0, sumSq = 0;
+                                for (const sid of sourceIds) {
+                                    const v = this._pixelCache[sid][i][p];
+                                    sum += v;
+                                    sumSq += v * v;
+                                }
+                                const mean = sum / numSrc;
+                                const variance = sumSq / numSrc - mean * mean;
+                                sumStd += Math.sqrt(Math.max(0, variance));
+                            }
+                        }
+                        blockScores[by * GRID + bx] = sumStd / BLOCK_PIXELS;
+                    }
+                }
+
+                // L2: Top-K RMS across blocks
+                const topK = new Float32Array(TOP_K);
+                for (let k = 0; k < NUM_BLOCKS; k++) {
+                    const v = blockScores[k];
+                    if (v > topK[TOP_K - 1]) {
+                        topK[TOP_K - 1] = v;
+                        for (let j = TOP_K - 1; j > 0 && topK[j] > topK[j - 1]; j--) {
+                            const tmp = topK[j]; topK[j] = topK[j - 1]; topK[j - 1] = tmp;
+                        }
+                    }
+                }
+                let topKSumSq = 0;
+                for (let k = 0; k < TOP_K; k++) topKSumSq += topK[k] * topK[k];
+                scores[i] = Math.sqrt(topKSumSq / TOP_K);
+            }
+            this._divergenceScores = scores;
+        };
+
+        nodeType.prototype._computeAttention = function () {
+            if (!this._pixelCache) return;
+
+            const div = this._divergenceScores;
+            if (!div) return;
+            const B = div.length;
+
+            // Apply absolute threshold
+            const divClean = new Float32Array(div);
+            for (let i = 0; i < B; i++) {
+                if (divClean[i] < ATTENTION_DIV_THRESH) divClean[i] = 0;
+            }
+
+            // A signal Y-max
+            const divSorted = [...divClean].sort((a, b) => a - b);
+            const divP95 = divSorted[Math.floor(B * 0.95)] || 0;
+            this._attentionDivYMax = Math.max(ATTENTION_Y_FLOOR, divP95 * 2);
+
+            this._attentionDiv = divClean;
+        };
+
+        nodeType.prototype._drawAttentionWaveform = function (ctx, areaW, areaH) {
+            const div = this._attentionDiv;
+            if (!div || div.length < 2) return;
+
+            const n = div.length;
+            const waveMaxH = areaH * ATTENTION_WAVE_RATIO;
+            const baseY = PADDING.top + areaH;
+            const divYMax = this._attentionDivYMax;
+
+            const toX = (i) => PADDING.left + (i / (n - 1)) * areaW;
+            const toH = (v) => Math.min(v / divYMax, 1.0) * waveMaxH;
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(toX(0), baseY);
+            for (let i = 0; i < n; i++) ctx.lineTo(toX(i), baseY - toH(div[i]));
+            ctx.lineTo(toX(n - 1), baseY);
+            ctx.closePath();
+            ctx.fillStyle = ATTENTION_DIV_COLOR;
+            ctx.fill();
+            ctx.restore();
+        };
+
+        // ── Auto curve optimization ─────────────────────────────
+
+        nodeType.prototype._computeOptimalCurves = function () {
+            if (!this._pixelCache) return;
+            const sourceIds = Object.keys(this._pixelCache);
+            if (sourceIds.length < 2) return;
+
+            const B = this._pixelCache[sourceIds[0]].length;
+            if (B < 2) return;
+            const SZ = ATTENTION_CACHE_SIZE;
+            const numPixels = SZ * SZ;
+            const numSrc = sourceIds.length;
+
+            const hasFlow = this._flowCache &&
+                            this._flowCache.bwd &&
+                            this._flowCache.bwd.length >= B - 1;
+
+            // ── Step 1: Per-frame optimal weights via constrained QP ──
+
+            // For each frame, compute temporal diff per source, build 3×3 matrix, solve QP
+            const perFrameWeights = new Array(B); // [B][numSrc]
+
+            for (let i = 0; i < B; i++) {
+                if (i === 0) {
+                    // First frame: equal weights (no temporal diff available)
+                    perFrameWeights[0] = new Float32Array(numSrc).fill(1 / numSrc);
+                    continue;
+                }
+
+                // Compute per-source diff vectors (Δ[s][p] = curr[s][p] - ref[s][p])
+                const deltas = new Array(numSrc);
+                for (let s = 0; s < numSrc; s++) {
+                    const sid = sourceIds[s];
+                    const curr = this._pixelCache[sid][i];
+                    const prev = this._pixelCache[sid][i - 1];
+                    const delta = new Float32Array(numPixels);
+
+                    if (hasFlow) {
+                        const flow = this._flowCache.bwd[i - 1];
+                        for (let y = 0; y < SZ; y++) {
+                            for (let x = 0; x < SZ; x++) {
+                                const p = y * SZ + x;
+                                const sx = x + flow.dx[p];
+                                const sy = y + flow.dy[p];
+                                const sx0 = Math.floor(sx), sy0 = Math.floor(sy);
+                                const sx1 = sx0 + 1, sy1 = sy0 + 1;
+                                if (sx0 >= 0 && sx1 < SZ && sy0 >= 0 && sy1 < SZ) {
+                                    const fx = sx - sx0, fy = sy - sy0;
+                                    const ref = prev[sy0 * SZ + sx0] * (1 - fx) * (1 - fy) +
+                                                prev[sy0 * SZ + sx1] * fx * (1 - fy) +
+                                                prev[sy1 * SZ + sx0] * (1 - fx) * fy +
+                                                prev[sy1 * SZ + sx1] * fx * fy;
+                                    delta[p] = curr[p] - ref;
+                                } else {
+                                    delta[p] = 0; // out of bounds: no diff
+                                }
+                            }
+                        }
+                    } else {
+                        for (let p = 0; p < numPixels; p++) {
+                            delta[p] = curr[p] - prev[p];
+                        }
+                    }
+                    deltas[s] = delta;
+                }
+
+                // Build numSrc × numSrc PSD matrix: M[a][b] = Σ_p Δa[p] * Δb[p]
+                const M = new Array(numSrc);
+                for (let a = 0; a < numSrc; a++) M[a] = new Float32Array(numSrc);
+                for (let a = 0; a < numSrc; a++) {
+                    for (let b = a; b < numSrc; b++) {
+                        let dot = 0;
+                        for (let p = 0; p < numPixels; p++) {
+                            dot += deltas[a][p] * deltas[b][p];
+                        }
+                        M[a][b] = dot;
+                        M[b][a] = dot;
+                    }
+                }
+
+                // Solve: min w^T M w, s.t. Σw=1, w≥0
+                perFrameWeights[i] = this._solveSimplexQP(M, numSrc);
+            }
+
+            // ── Step 2: Gaussian smooth (σ = 3 frames) ──
+
+            const SIGMA = 3;
+            const KERNEL_HALF = Math.ceil(SIGMA * 3);
+            const smoothed = new Array(numSrc);
+            for (let s = 0; s < numSrc; s++) {
+                smoothed[s] = new Float32Array(B);
+            }
+
+            for (let i = 0; i < B; i++) {
+                let gSum = 0;
+                const wAcc = new Float32Array(numSrc);
+                for (let j = Math.max(0, i - KERNEL_HALF); j <= Math.min(B - 1, i + KERNEL_HALF); j++) {
+                    const d = i - j;
+                    const g = Math.exp(-(d * d) / (2 * SIGMA * SIGMA));
+                    gSum += g;
+                    for (let s = 0; s < numSrc; s++) {
+                        wAcc[s] += perFrameWeights[j][s] * g;
+                    }
+                }
+                // Normalize to sum=1
+                let wTotal = 0;
+                for (let s = 0; s < numSrc; s++) {
+                    smoothed[s][i] = wAcc[s] / gSum;
+                    wTotal += smoothed[s][i];
+                }
+                if (wTotal > 0) {
+                    for (let s = 0; s < numSrc; s++) smoothed[s][i] /= wTotal;
+                }
+            }
+
+            // ── Step 3: DP joint segmentation ──
+
+            const useStep = this.interpMode === "step";
+
+            // Precompute prefix sums
+            const prefixSum = new Array(numSrc);
+            const prefixSumSq = new Array(numSrc);
+            for (let s = 0; s < numSrc; s++) {
+                prefixSum[s] = new Float64Array(B + 1);
+                prefixSumSq[s] = new Float64Array(B + 1);
+                for (let i = 0; i < B; i++) {
+                    prefixSum[s][i + 1] = prefixSum[s][i] + smoothed[s][i];
+                    prefixSumSq[s][i + 1] = prefixSumSq[s][i] + smoothed[s][i] * smoothed[s][i];
+                }
+            }
+
+            // For linear cost: prefix sums of i*w[s][i] and i²
+            const prefixIW = new Array(numSrc);
+            const prefixI = new Float64Array(B + 1);
+            const prefixISq = new Float64Array(B + 1);
+            if (!useStep) {
+                for (let s = 0; s < numSrc; s++) {
+                    prefixIW[s] = new Float64Array(B + 1);
+                    for (let i = 0; i < B; i++) {
+                        prefixIW[s][i + 1] = prefixIW[s][i] + i * smoothed[s][i];
+                    }
+                }
+                for (let i = 0; i < B; i++) {
+                    prefixI[i + 1] = prefixI[i] + i;
+                    prefixISq[i + 1] = prefixISq[i] + i * i;
+                }
+            }
+
+            // Step cost: constant segment, Σ(w - mean)² = sumSq - sum²/n
+            const stepCost = (l, r) => {
+                const n = r - l + 1;
+                if (n <= 0) return Infinity;
+                let cost = 0;
+                for (let s = 0; s < numSrc; s++) {
+                    const sum = prefixSum[s][r + 1] - prefixSum[s][l];
+                    const sumSq = prefixSumSq[s][r + 1] - prefixSumSq[s][l];
+                    cost += sumSq - (sum * sum) / n;
+                }
+                return cost;
+            };
+
+            // Linear cost: best-fit line per source, Σ(w - (a + b*i))²
+            // Closed form: sumSq - (sumI·sumW - n·sumIW)² / (n·sumISq - sumI²) - sumW²/n
+            // Using linear regression residual = sumWSq - a·sumW - b·sumIW
+            const linearCost = (l, r) => {
+                const n = r - l + 1;
+                if (n <= 1) return 0;
+                const si = prefixI[r + 1] - prefixI[l];
+                const si2 = prefixISq[r + 1] - prefixISq[l];
+                const denom = n * si2 - si * si;
+                if (Math.abs(denom) < 1e-12) return stepCost(l, r);
+                let cost = 0;
+                for (let s = 0; s < numSrc; s++) {
+                    const sw = prefixSum[s][r + 1] - prefixSum[s][l];
+                    const sw2 = prefixSumSq[s][r + 1] - prefixSumSq[s][l];
+                    const siw = prefixIW[s][r + 1] - prefixIW[s][l];
+                    const b = (n * siw - si * sw) / denom;
+                    const a = (sw - b * si) / n;
+                    cost += sw2 - a * sw - b * siw;
+                }
+                return Math.max(0, cost);
+            };
+
+            const segCost = useStep ? stepCost : linearCost;
+
+            // Total variance (K=1 baseline)
+            const totalCost = segCost(0, B - 1);
+            const EPS = totalCost * 0.02; // 2% residual threshold
+
+            let bestK = 1;
+            let bestSplits = [0]; // segment start indices
+            let bestCost = totalCost;
+
+            const MAX_K = Math.min(20, Math.floor(B / 3));
+
+            for (let K = 2; K <= MAX_K; K++) {
+                const dp = new Array(K + 1);
+                const split = new Array(K + 1);
+                for (let k = 0; k <= K; k++) {
+                    dp[k] = new Float64Array(B).fill(Infinity);
+                    split[k] = new Int32Array(B).fill(-1);
+                }
+
+                for (let i = 0; i < B; i++) {
+                    dp[1][i] = segCost(0, i);
+                    split[1][i] = 0;
+                }
+
+                for (let k = 2; k <= K; k++) {
+                    for (let i = k - 1; i < B; i++) {
+                        for (let j = k - 2; j < i; j++) {
+                            const c = dp[k - 1][j] + segCost(j + 1, i);
+                            if (c < dp[k][i]) {
+                                dp[k][i] = c;
+                                split[k][i] = j;
+                            }
+                        }
+                    }
+                }
+
+                const dpCost = dp[K][B - 1];
+                if (dpCost < bestCost) {
+                    bestCost = dpCost;
+                    bestK = K;
+
+                    const splits = [];
+                    let pos = B - 1;
+                    for (let k = K; k >= 1; k--) {
+                        const start = (k === 1) ? 0 : split[k][pos] + 1;
+                        splits.unshift(start);
+                        if (k > 1) pos = split[k][pos];
+                    }
+                    bestSplits = splits;
+                }
+
+                if (dpCost < EPS) break;
+            }
+
+            // ── Step 4: Output anchors ──
+
+            if (useStep) {
+                // Step mode: one anchor per segment with segment mean
+                const segments = [];
+                for (let seg = 0; seg < bestSplits.length; seg++) {
+                    const l = bestSplits[seg];
+                    const r = (seg < bestSplits.length - 1) ? bestSplits[seg + 1] - 1 : B - 1;
+                    const n = r - l + 1;
+                    const w = new Float32Array(numSrc);
+                    for (let s = 0; s < numSrc; s++) {
+                        w[s] = (prefixSum[s][r + 1] - prefixSum[s][l]) / n;
+                    }
+                    let wSum = 0;
+                    for (let s = 0; s < numSrc; s++) wSum += w[s];
+                    if (wSum > 0) {
+                        for (let s = 0; s < numSrc; s++) w[s] /= wSum;
+                    }
+                    segments.push({ start: l, w });
+                }
+
+                for (let s = 0; s < numSrc; s++) {
+                    const curve = this.curves.find(c => c.id === sourceIds[s]);
+                    if (!curve) continue;
+                    const anchors = [];
+                    for (const seg of segments) {
+                        anchors.push([seg.start / (B - 1), seg.w[s]]);
+                    }
+                    if (anchors[anchors.length - 1][0] < 1) {
+                        anchors.push([1, segments[segments.length - 1].w[s]]);
+                    }
+                    curve.anchors = anchors;
+                }
+            } else {
+                // Non-step modes: anchors at breakpoints with smoothed weight values
+                // Collect unique breakpoint frames (start of each segment + end)
+                const breakpoints = [...bestSplits];
+                if (breakpoints[breakpoints.length - 1] !== B - 1) {
+                    breakpoints.push(B - 1);
+                }
+                // Ensure frame 0 is included
+                if (breakpoints[0] !== 0) breakpoints.unshift(0);
+
+                for (let s = 0; s < numSrc; s++) {
+                    const curve = this.curves.find(c => c.id === sourceIds[s]);
+                    if (!curve) continue;
+                    const anchors = [];
+                    for (const bp of breakpoints) {
+                        let w = smoothed[s][bp];
+                        // Normalize across sources at this frame
+                        let wSum = 0;
+                        for (let s2 = 0; s2 < numSrc; s2++) wSum += smoothed[s2][bp];
+                        if (wSum > 0) w /= wSum;
+                        anchors.push([bp / (B - 1), w]);
+                    }
+                    curve.anchors = anchors;
+                }
+            }
+
+            this._rebuildLegend();
+            this._syncCurveData();
+            this._rebuildBlendCache();
+            this._drawCurves();
+            this._renderBlendedFrame();
+        };
+
+        nodeType.prototype._solveSimplexQP = function (M, n) {
+            // Solve: min w^T M w, s.t. Σw=1, w≥0
+            // Enumerate all faces of the simplex
+            let bestW = null;
+            let bestCost = Infinity;
+
+            // Helper: solve unconstrained on active set with Σw=1
+            const solveActive = (active) => {
+                const k = active.length;
+                if (k === 1) {
+                    const w = new Float32Array(n);
+                    w[active[0]] = 1;
+                    return { w, cost: M[active[0]][active[0]] };
+                }
+                if (k === 2) {
+                    const [a, b] = active;
+                    // min w_a² M_aa + 2 w_a w_b M_ab + w_b² M_bb, w_a + w_b = 1
+                    // w_b = 1 - w_a → quadratic in w_a
+                    // d/dw_a = 2 w_a M_aa + 2(1-2w_a) M_ab - 2(1-w_a) M_bb = 0
+                    // w_a (M_aa - 2M_ab + M_bb) = M_bb - M_ab
+                    const denom = M[a][a] - 2 * M[a][b] + M[b][b];
+                    let wa;
+                    if (Math.abs(denom) < 1e-12) {
+                        wa = 0.5;
+                    } else {
+                        wa = (M[b][b] - M[a][b]) / denom;
+                    }
+                    wa = Math.max(0, Math.min(1, wa));
+                    const wb = 1 - wa;
+                    const w = new Float32Array(n);
+                    w[a] = wa;
+                    w[b] = wb;
+                    const cost = wa * wa * M[a][a] + 2 * wa * wb * M[a][b] + wb * wb * M[b][b];
+                    return { w, cost };
+                }
+                if (k === 3) {
+                    const [a, b, c] = active;
+                    // Lagrange: (2M + λI)w = λ1, Σw=1
+                    // Solve M^{-1} * 1 proportionally
+                    // For 3×3: use Cramer's rule to solve Mw = 1
+                    const det3 = (m) =>
+                        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+                        m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                        m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+
+                    const sub = [[M[a][a], M[a][b], M[a][c]],
+                                 [M[b][a], M[b][b], M[b][c]],
+                                 [M[c][a], M[c][b], M[c][c]]];
+                    const d = det3(sub);
+                    if (Math.abs(d) < 1e-12) return null;
+
+                    // Solve sub * v = [1,1,1]
+                    const replace = (mat, col, vec) => mat.map((row, i) =>
+                        row.map((val, j) => j === col ? vec[i] : val));
+                    const v0 = det3(replace(sub, 0, [1, 1, 1])) / d;
+                    const v1 = det3(replace(sub, 1, [1, 1, 1])) / d;
+                    const v2 = det3(replace(sub, 2, [1, 1, 1])) / d;
+                    const vSum = v0 + v1 + v2;
+                    if (Math.abs(vSum) < 1e-12) return null;
+
+                    const wa3 = v0 / vSum, wb3 = v1 / vSum, wc3 = v2 / vSum;
+                    if (wa3 < -1e-6 || wb3 < -1e-6 || wc3 < -1e-6) return null;
+
+                    const w = new Float32Array(n);
+                    w[a] = Math.max(0, wa3);
+                    w[b] = Math.max(0, wb3);
+                    w[c] = Math.max(0, wc3);
+                    let cost = 0;
+                    for (let i = 0; i < k; i++) {
+                        for (let j = 0; j < k; j++) {
+                            cost += w[active[i]] * w[active[j]] * M[active[i]][active[j]];
+                        }
+                    }
+                    return { w, cost };
+                }
+                return null;
+            };
+
+            // Enumerate: all subsets of {0..n-1}
+            for (let mask = 1; mask < (1 << n); mask++) {
+                const active = [];
+                for (let s = 0; s < n; s++) {
+                    if (mask & (1 << s)) active.push(s);
+                }
+                const result = solveActive(active);
+                if (result && result.cost < bestCost) {
+                    bestCost = result.cost;
+                    bestW = result.w;
+                }
+            }
+
+            return bestW || new Float32Array(n).fill(1 / n);
+        };
+
         // ── Sync curve data to hidden widget ────────────────────
 
         nodeType.prototype._syncCurveData = function () {
+            // Invalidate blend cache — will be rebuilt on next _renderBlendedFrame trigger
+            this._blendCache = null;
+
             const cdWidget = this.widgets?.find(w => w.name === "curve_data");
             if (cdWidget) {
                 const data = {

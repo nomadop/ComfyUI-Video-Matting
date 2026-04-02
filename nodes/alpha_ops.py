@@ -225,6 +225,7 @@ class AlphaCurveBlend:
             "optional": {
                 "alpha_b": ("MASK",),
                 "alpha_c": ("MASK",),
+                "optical_flow": ("OPTICAL_FLOW", {"tooltip": "Bidirectional optical flow for motion-compensated attention waveform"}),
             }
         }
 
@@ -234,7 +235,7 @@ class AlphaCurveBlend:
     OUTPUT_NODE = True
     CATEGORY = "Video Matting/Alpha"
 
-    def blend(self, alpha_a, curve_data, alpha_b=None, alpha_c=None):
+    def blend(self, alpha_a, curve_data, alpha_b=None, alpha_c=None, optical_flow=None):
         sources = {"a": alpha_a}
         if alpha_b is not None:
             sources["b"] = alpha_b
@@ -289,11 +290,18 @@ class AlphaCurveBlend:
 
         blended = torch.stack(result, dim=0)
 
+        ui_data = {
+            "source_frames": [source_frames],
+            "total_frames": [B],
+        }
+
+        # Encode optical flow to PNG temp files for frontend
+        if optical_flow is not None:
+            flow_frames = self._encode_flow(optical_flow)
+            ui_data["optical_flow"] = [flow_frames]
+
         return {
-            "ui": {
-                "source_frames": [source_frames],
-                "total_frames": [B],
-            },
+            "ui": ui_data,
             "result": (blended,),
         }
 
@@ -313,6 +321,59 @@ class AlphaCurveBlend:
                 "type": self.type,
             })
         return frames
+
+    def _encode_flow(self, optical_flow):
+        """Encode optical flow tensors to uint8 RGB PNGs for frontend.
+
+        Flow vectors are stored as: R = dx + 128, G = dy + 128, B = 0.
+        Values are clamped to [-127, 127] pixel range.
+
+        Returns dict with fwd/bwd frame lists and metadata.
+        """
+        import torch.nn.functional as F
+
+        fwd = optical_flow["fwd"]  # [N, 2, H, W]
+        bwd = optical_flow["bwd"]  # [N, 2, H, W]
+        flow_h = optical_flow["flow_h"]
+        flow_w = optical_flow["flow_w"]
+        N = fwd.shape[0]
+
+        fwd_frames = []
+        bwd_frames = []
+
+        for i in range(N):
+            for flow, direction, frame_list in [
+                (fwd[i], "fwd", fwd_frames),
+                (bwd[i], "bwd", bwd_frames),
+            ]:
+                # flow: [2, H, W] float32 in pixel units
+                dx = flow[0].numpy()  # [H, W]
+                dy = flow[1].numpy()  # [H, W]
+
+                # Clamp to [-127, 127] and encode as uint8 with 128 offset
+                dx_u8 = np.clip(dx + 128, 0, 255).astype(np.uint8)
+                dy_u8 = np.clip(dy + 128, 0, 255).astype(np.uint8)
+                zero = np.zeros_like(dx_u8)
+
+                rgb = np.stack([dx_u8, dy_u8, zero], axis=-1)  # [H, W, 3]
+                img = Image.fromarray(rgb, mode='RGB')
+
+                filename = f"{self.prefix}_flow_{direction}_{i:05d}.png"
+                filepath = os.path.join(self.output_dir, filename)
+                img.save(filepath, compress_level=self.compress_level)
+
+                frame_list.append({
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": self.type,
+                })
+
+        return {
+            "fwd": fwd_frames,
+            "bwd": bwd_frames,
+            "flow_h": flow_h,
+            "flow_w": flow_w,
+        }
 
     def _parse_curves(self, curve_data, sources):
         """Parse curve_data JSON. Returns (curves_list, mode)."""
