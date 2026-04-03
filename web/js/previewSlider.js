@@ -402,16 +402,40 @@ app.registerExtension({
         };
 
         // ── Preview cache ─────────────────────────────────────────────────
+        const MAX_CONCURRENT = 4;
+
         nodeType.prototype._buildPreviewCache = function () {
             this._previewCache = { main: new Array(this.totalFrames), bw: new Array(this.totalFrames) };
-            for (let i = 0; i < this.totalFrames; i++) {
-                this._cacheFrame(i);
+            this._cacheQueue = [];
+            this._cacheLoading = 0;
+
+            // Current frame first, then by distance
+            const order = [this.currentFrame];
+            for (let d = 1; d < this.totalFrames; d++) {
+                if (this.currentFrame + d < this.totalFrames) order.push(this.currentFrame + d);
+                if (this.currentFrame - d >= 0) order.push(this.currentFrame - d);
+            }
+            this._cacheQueue = order;
+            this._drainCacheQueue();
+        };
+
+        nodeType.prototype._drainCacheQueue = function () {
+            const cache = this._previewCache;
+            while (this._cacheLoading < MAX_CONCURRENT && this._cacheQueue.length > 0) {
+                const idx = this._cacheQueue.shift();
+                if (cache?.main[idx]) continue;
+                this._cacheLoading++;
+                this._cacheFrame(idx).then(() => {
+                    this._cacheLoading--;
+                    // Yield to main thread so other nodes' onExecuted can run
+                    setTimeout(() => this._drainCacheQueue(), 0);
+                });
             }
         };
 
         nodeType.prototype._cacheFrame = function (frameIndex) {
             const cache = this._previewCache;
-            if (!cache) return;
+            if (!cache) return Promise.resolve();
 
             const edited = this.editedMasks.has(frameIndex);
             const frame = edited ? this.editedMasks.get(frameIndex) : this.frames[frameIndex];
@@ -422,7 +446,7 @@ app.registerExtension({
                 const rgbURL = viewURL(frame, "rgb", this._cacheTs);
                 const alphaURL = viewURL(frame, "a", this._cacheTs);
 
-                Promise.all([loadImage(rgbURL), loadImage(alphaURL)]).then(([rgbImg, aImg]) => {
+                return Promise.all([loadImage(rgbURL), loadImage(alphaURL)]).then(([rgbImg, aImg]) => {
                     const w = rgbImg.naturalWidth;
                     const h = rgbImg.naturalHeight;
 
@@ -475,7 +499,7 @@ app.registerExtension({
                 }).catch(() => {});
             } else if (this.hasImages) {
                 // Simple RGB
-                loadImage(viewURL(frame, "rgb", this._cacheTs)).then(img => {
+                return loadImage(viewURL(frame, "rgb", this._cacheTs)).then(img => {
                     const c = document.createElement("canvas");
                     c.width = img.naturalWidth;
                     c.height = img.naturalHeight;
@@ -486,7 +510,7 @@ app.registerExtension({
                 }).catch(() => {});
             } else {
                 // Mask only (no RGB)
-                loadImage(viewURL(frame, "a", this._cacheTs)).then(img => {
+                return loadImage(viewURL(frame, "a", this._cacheTs)).then(img => {
                     const w = img.naturalWidth;
                     const h = img.naturalHeight;
                     const c = document.createElement("canvas");
