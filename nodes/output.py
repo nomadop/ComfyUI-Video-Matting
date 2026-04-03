@@ -191,6 +191,7 @@ class PreviewSlider:
             "optional": {
                 "images": ("IMAGE",),
                 "mask": ("MASK",),
+                "optical_flow": ("OPTICAL_FLOW",),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -204,8 +205,8 @@ class PreviewSlider:
     OUTPUT_NODE = True
     CATEGORY = "Video Matting/Debug"
 
-    def preview(self, edited_masks="{}", images=None, mask=None, prompt=None,
-                extra_pnginfo=None):
+    def preview(self, edited_masks="{}", images=None, mask=None, optical_flow=None,
+                prompt=None, extra_pnginfo=None):
         if images is None and mask is None:
             return {"ui": {"frames": []}, "result": (torch.zeros(1, 64, 64),)}
 
@@ -316,14 +317,63 @@ class PreviewSlider:
 
         mask_tensor = torch.stack(result_mask, dim=0)
 
+        ui_data = {
+            "frames": frames,
+            "has_images": [has_images],
+            "has_mask": [has_mask],
+            "input_fingerprint": [fp],
+        }
+
+        # Encode optical flow for frontend propagation
+        if optical_flow is not None:
+            ui_data["optical_flow"] = [self._encode_flow(optical_flow)]
+
         return {
-            "ui": {
-                "frames": frames,
-                "has_images": [has_images],
-                "has_mask": [has_mask],
-                "input_fingerprint": [fp],
-            },
+            "ui": ui_data,
             "result": (mask_tensor,),
+        }
+
+
+    def _encode_flow(self, optical_flow):
+        """Encode optical flow to RGB PNGs for frontend.
+
+        R = dx + 128, G = dy + 128, B = 0. Clamped to [-127, 127].
+        """
+        fwd = optical_flow["fwd"]  # [N, 2, H, W]
+        bwd = optical_flow["bwd"]
+        flow_h = optical_flow["flow_h"]
+        flow_w = optical_flow["flow_w"]
+        N = fwd.shape[0]
+
+        fwd_frames = []
+        bwd_frames = []
+
+        for i in range(N):
+            for flow, direction, frame_list in [
+                (fwd[i], "fwd", fwd_frames),
+                (bwd[i], "bwd", bwd_frames),
+            ]:
+                dx = flow[0].numpy()
+                dy = flow[1].numpy()
+                dx_u8 = np.clip(dx + 128, 0, 255).astype(np.uint8)
+                dy_u8 = np.clip(dy + 128, 0, 255).astype(np.uint8)
+                zero = np.zeros_like(dx_u8)
+                rgb = np.stack([dx_u8, dy_u8, zero], axis=-1)
+                img = Image.fromarray(rgb, mode='RGB')
+                filename = f"{self.prefix}_flow_{direction}_{i:05d}.png"
+                filepath = os.path.join(self.output_dir, filename)
+                img.save(filepath, compress_level=self.compress_level)
+                frame_list.append({
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": self.type,
+                })
+
+        return {
+            "fwd": fwd_frames,
+            "bwd": bwd_frames,
+            "flow_h": flow_h,
+            "flow_w": flow_w,
         }
 
 

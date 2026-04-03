@@ -1,6 +1,11 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const PROPAGATE_WINDOW = 3;        // propagate edits ±N frames
+const PROPAGATE_DIFF_THRESHOLD = 0.03; // ignore diff below this (re-encoding noise)
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function viewURL(frame, channel, cacheTs) {
@@ -35,17 +40,19 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             onNodeCreated?.apply(this, arguments);
-
             this.frames = [];
             this.totalFrames = 0;
             this.currentFrame = 0;
             this.hasImages = false;
             this.hasMask = false;
-            this.editedMasks = new Map(); // frameIndex → {filename, subfolder, type}
+            this.editedMasks = new Map(); // frameIndex → {filename, subfolder, type, source}
             this._renderGen = 0; // generation counter to discard stale renders
             this._showMaskBW = false; // toggle: overlay vs B&W mask
             this._cacheTs = "0";
             this._lastFingerprint = null;
+            this._flowCache = null; // { fwd: [{dx,dy},...], bwd: [{dx,dy},...] }
+            this._flowMeta = null;  // { flow_h, flow_w }
+            this._propagating = false;
 
             // Prevent LiteGraph from rendering built-in image preview
             // (we have our own canvas preview). This stops node.imgs from
@@ -170,16 +177,37 @@ app.registerExtension({
 
             container.appendChild(sliderRow);
 
-            // ── Edited frames indicator ────────────────────────────────────
+            // ── Progress bar + edited frames indicator ─────────────────────
+            const statusRow = document.createElement("div");
+            statusRow.style.cssText = `
+                width: 100%; margin-top: 4px; min-height: 16px; flex-shrink: 0;
+            `;
+
+            const progressBar = document.createElement("div");
+            progressBar.style.cssText = `
+                width: 100%; height: 3px; background: #333;
+                border-radius: 2px; overflow: hidden; display: none;
+            `;
+            const progressFill = document.createElement("div");
+            progressFill.style.cssText = `
+                height: 100%; width: 0%; background: #4CAF50;
+                transition: width 0.15s ease;
+            `;
+            progressBar.appendChild(progressFill);
+            statusRow.appendChild(progressBar);
+            this.progressBar = progressBar;
+            this.progressFill = progressFill;
+
             const editedRow = document.createElement("div");
             editedRow.style.cssText = `
                 width: 100%; font-size: 11px; color: #888;
-                margin-top: 4px; min-height: 16px; flex-shrink: 0;
                 overflow: hidden; white-space: nowrap;
                 text-overflow: ellipsis;
             `;
-            container.appendChild(editedRow);
+            statusRow.appendChild(editedRow);
             this.editedRow = editedRow;
+
+            container.appendChild(statusRow);
 
             this.container = container;
 
@@ -196,11 +224,26 @@ app.registerExtension({
             this.setSize([300, 340]);
 
             // Hide the edited_masks widget (data-only, synced by _syncEditedMasks)
+            // Protect against external overwrites (e.g., mask editor's updateNodeWithServerReferences)
             const emWidget = this.widgets?.find(w => w.name === "edited_masks");
             if (emWidget) {
                 emWidget.type = "converted-widget";
                 emWidget.computeSize = () => [0, -4];
                 emWidget.hidden = true;
+
+                const self2 = this;
+                let _emValue = emWidget.value;
+                Object.defineProperty(emWidget, "value", {
+                    get() { return _emValue; },
+                    set(val) {
+                        if (val === "{}" && self2.editedMasks.size > 0) {
+                            return; // block external overwrite
+                        }
+                        _emValue = val;
+                    },
+                    configurable: true,
+                    enumerable: true,
+                });
             }
 
             // Restore editedMasks from widget
@@ -245,6 +288,16 @@ app.registerExtension({
                 this.updateSlider();
                 this.updatePreview(Math.min(this.currentFrame, this.totalFrames - 1));
                 this._buildPreviewCache();
+
+                // Load optical flow if present
+                const flowData = message.optical_flow?.[0];
+                if (flowData) {
+                    this._flowMeta = { flow_h: flowData.flow_h, flow_w: flowData.flow_w };
+                    this._preloadFlow(flowData);
+                } else {
+                    this._flowCache = null;
+                    this._flowMeta = null;
+                }
             }
         };
 
@@ -281,10 +334,9 @@ app.registerExtension({
             const needsOverlay = this.hasMask || edited;
 
             if (this._showMaskBW && needsOverlay) {
-                // B&W mask view (click canvas to toggle)
                 this._renderMaskOnly(frame, gen);
             } else if (needsOverlay) {
-                this._renderOverlay(frame, edited, gen);
+                this._renderOverlay(frame, frame, gen);
             } else if (this.hasImages) {
                 this._renderSimple(frame, "rgb", gen);
             } else {
@@ -326,11 +378,9 @@ app.registerExtension({
         };
 
         // ── _renderOverlay: RGB base + dark mask overlay ───────────────────
-        nodeType.prototype._renderOverlay = function (frame, isEdited, gen) {
-            // For edited frames, the file itself is RGBA (from mask editor save)
-            // For original frames with mask, the backend saved RGBA
-            const rgbURL = viewURL(frame, "rgb", this._cacheTs);
-            const alphaURL = viewURL(frame, "a", this._cacheTs);
+        nodeType.prototype._renderOverlay = function (rgbFrame, alphaFrame, gen) {
+            const rgbURL = viewURL(rgbFrame, "rgb", this._cacheTs);
+            const alphaURL = viewURL(alphaFrame, "a", this._cacheTs);
 
             Promise.all([loadImage(rgbURL), loadImage(alphaURL)]).then(([rgbImg, aImg]) => {
                 if (gen !== this._renderGen) return;
@@ -402,12 +452,20 @@ app.registerExtension({
         };
 
         // ── Preview cache ─────────────────────────────────────────────────
-        const MAX_CONCURRENT = 4;
+        const MAX_CONCURRENT = 8;
 
         nodeType.prototype._buildPreviewCache = function () {
             this._previewCache = { main: new Array(this.totalFrames), bw: new Array(this.totalFrames) };
             this._cacheQueue = [];
             this._cacheLoading = 0;
+            this._cacheTotal = this.totalFrames;
+            this._cacheDone = 0;
+
+            // Show progress bar
+            if (this.progressBar) {
+                this.progressBar.style.display = "block";
+                this.progressFill.style.width = "0%";
+            }
 
             // Current frame first, then by distance
             const order = [this.currentFrame];
@@ -423,10 +481,22 @@ app.registerExtension({
             const cache = this._previewCache;
             while (this._cacheLoading < MAX_CONCURRENT && this._cacheQueue.length > 0) {
                 const idx = this._cacheQueue.shift();
-                if (cache?.main[idx]) continue;
+                if (cache?.main[idx]) {
+                    this._cacheDone++;
+                    continue;
+                }
                 this._cacheLoading++;
                 this._cacheFrame(idx).then(() => {
                     this._cacheLoading--;
+                    this._cacheDone++;
+                    // Update progress
+                    if (this.progressFill && this._cacheTotal > 0) {
+                        const pct = Math.round(this._cacheDone / this._cacheTotal * 100);
+                        this.progressFill.style.width = pct + "%";
+                        if (pct >= 100) {
+                            setTimeout(() => { this.progressBar.style.display = "none"; }, 500);
+                        }
+                    }
                     // Yield to main thread so other nodes' onExecuted can run
                     setTimeout(() => this._drainCacheQueue(), 0);
                 });
@@ -535,13 +605,14 @@ app.registerExtension({
         };
 
         // ── openMaskEditor ─────────────────────────────────────────────────
-        nodeType.prototype.openMaskEditor = function () {
+        nodeType.prototype.openMaskEditor = async function () {
             if (!this.frames || this.frames.length === 0) return;
 
             const editFrame = this.currentFrame;
             const self = this;
 
-            // If edited before, load edited version (continues editing)
+            // If edited/propagated before, load that version (continues editing)
+            // Server stores proper RGBA for both manual and propagated edits
             const source = this.editedMasks.has(editFrame)
                 ? this.editedMasks.get(editFrame)
                 : this.frames[editFrame];
@@ -559,24 +630,60 @@ app.registerExtension({
                 this.imageIndex = 0;
 
                 // Trap on images: mask editor sets node.images = [ref] on save.
-                // The editor may also write to node.images during init
-                // (e.g. normalizing type), so only treat writes with a NEW
-                // filename as actual saves.
+                // Build a set of all known filenames — only a genuinely NEW file
+                // (not seen before) counts as a save. This prevents false triggers
+                // when the editor writes stale clipspace data on cancel/init.
+                // The trap stays active (never deleted) to absorb all writes safely.
+                const knownFiles = new Set();
+                for (const f of this.frames) knownFiles.add(f.filename);
+                for (const v of this.editedMasks.values()) knownFiles.add(v.filename);
+
                 let _images = this.images;
-                const sourceFilename = source.filename;
+                let _handled = false;
                 Object.defineProperty(this, "images", {
                     get() { return _images; },
                     set(val) {
                         _images = val;
-                        if (val?.[0]?.filename && val[0].filename !== sourceFilename) {
+                        const isNew = val?.[0]?.filename && !knownFiles.has(val[0].filename);
+                        if (!_handled && isNew) {
+                            _handled = true;
+                            knownFiles.add(val[0].filename);
                             self._handleMaskSave(editFrame, val[0]);
-                            delete self.images;
-                            self.images = val;
                         }
                     },
                     configurable: true,
                     enumerable: true,
                 });
+
+                // Temporarily block ComfyUI's undo/redo while mask editor is open.
+                // The changeTracker's keydown listener fires before any stopPropagation
+                // can catch it, so we intercept at the loadGraphData level instead.
+                const origLoadGraphData = app.loadGraphData?.bind(app);
+                if (origLoadGraphData) {
+                    app.loadGraphData = function (...args) {
+                        // Allow normal loads (e.g. from file), block undo-triggered loads
+                        // Undo calls come through changeTracker → loadGraphData synchronously
+                        // after the keydown event. We block ALL calls while editor is open.
+                        console.warn("[PreviewSlider] loadGraphData blocked while mask editor open");
+                    };
+                }
+
+                // Watch for editor close to restore loadGraphData
+                const restoreOnClose = () => {
+                    const check = () => {
+                        const editorOpen = document.querySelector(
+                            ".comfy-modal-content canvas, .mask-editor, [class*='mask-editor']"
+                        );
+                        if (!editorOpen) {
+                            if (origLoadGraphData) app.loadGraphData = origLoadGraphData;
+                            return;
+                        }
+                        requestAnimationFrame(check);
+                    };
+                    // Start checking after a short delay (editor needs time to mount)
+                    setTimeout(check, 500);
+                };
+                restoreOnClose();
 
                 // Open mask editor via context menu callback
                 const options = [];
@@ -585,9 +692,7 @@ app.registerExtension({
                 if (opt) {
                     opt.callback();
                 } else {
-                    delete this.images;
-                    this.images = null;
-                    this.imgs = null;
+                    if (origLoadGraphData) app.loadGraphData = origLoadGraphData;
                     console.warn("[PreviewSlider] MaskEditor not found in context menu");
                 }
             }).catch(err => {
@@ -604,6 +709,7 @@ app.registerExtension({
                 filename: ref.filename,
                 subfolder: ref.subfolder || "",
                 type: ref.type || "input",
+                source: "manual",
             });
             this._syncEditedMasks();
             this._updateEditedIndicator();
@@ -615,13 +721,21 @@ app.registerExtension({
                 this._cacheFrame(frameIndex);
             }
             this.updatePreview(frameIndex);
+
+            // Propagate edit to neighboring frames via optical flow
+            if (this._flowCache) {
+                this._propagateAllEdits();
+            }
         };
 
         // ── _syncEditedMasks: serialize to hidden widget ───────────────────
         nodeType.prototype._syncEditedMasks = function () {
-            const obj = Object.fromEntries(this.editedMasks);
+            // Serialize without 'source' field (backend only needs filename/subfolder/type)
+            const obj = {};
+            for (const [k, v] of this.editedMasks) {
+                obj[k] = { filename: v.filename, subfolder: v.subfolder, type: v.type };
+            }
             const jsonStr = JSON.stringify(obj);
-
             const widget = this.widgets?.find(w => w.name === "edited_masks");
             if (widget) {
                 widget.value = jsonStr;
@@ -651,7 +765,7 @@ app.registerExtension({
                 return;
             }
             const indices = [...this.editedMasks.keys()].sort((a, b) => a - b);
-            this.editedRow.textContent = `Edited: ${indices.join(", ")}`;
+            this.editedRow.textContent = `Modified: ${indices.join(", ")} (${indices.length})`;
         };
 
         // ── resetEdits ────────────────────────────────────────────────────
@@ -662,6 +776,319 @@ app.registerExtension({
             this._updateEditedIndicator();
             this._buildPreviewCache();
             this.updatePreview(this.currentFrame);
+        };
+
+        // ── Optical flow loading ──────────────────────────────────────────
+        nodeType.prototype._preloadFlow = function (flowData) {
+            this._flowCache = null;
+            const fwdList = flowData.fwd || [];
+            const bwdList = flowData.bwd || [];
+            const N = fwdList.length;
+            if (N === 0) return;
+
+            const flowH = flowData.flow_h;
+            const flowW = flowData.flow_w;
+            const cache = { fwd: new Array(N), bwd: new Array(N) };
+            let pending = 0;
+            const total = N * 2;
+
+            const canvas = document.createElement("canvas");
+            canvas.width = flowW;
+            canvas.height = flowH;
+            const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+            const processImg = (img, direction, idx) => {
+                ctx.clearRect(0, 0, flowW, flowH);
+                ctx.drawImage(img, 0, 0, flowW, flowH);
+                const data = ctx.getImageData(0, 0, flowW, flowH).data;
+                const dx = new Float32Array(flowH * flowW);
+                const dy = new Float32Array(flowH * flowW);
+                for (let p = 0; p < dx.length; p++) {
+                    dx[p] = data[p * 4] - 128;
+                    dy[p] = data[p * 4 + 1] - 128;
+                }
+                cache[direction][idx] = { dx, dy };
+                pending++;
+                if (pending === total) {
+                    this._flowCache = cache;
+                }
+            };
+
+            for (let i = 0; i < N; i++) {
+                for (const [direction, list] of [["fwd", fwdList], ["bwd", bwdList]]) {
+                    const img = new Image();
+                    img.crossOrigin = "anonymous";
+                    const dir = direction, idx = i;
+                    img.onload = () => processImg(img, dir, idx);
+                    img.src = viewURL(list[i], null, this._cacheTs);
+                }
+            }
+        };
+
+        // ── Edit propagation via optical flow ─────────────────────────────
+
+        nodeType.prototype._propagateAllEdits = async function () {
+            if (this._propagating) return;
+            this._propagating = true;
+
+            try {
+                // Collect all manual edits
+                const manualEdits = [];
+                for (const [k, v] of this.editedMasks) {
+                    if (v.source === "manual") manualEdits.push(k);
+                }
+                if (manualEdits.length === 0) { this._propagating = false; return; }
+
+                // Clear all propagated entries
+                for (const [k, v] of [...this.editedMasks]) {
+                    if (v.source === "propagated") this.editedMasks.delete(k);
+                }
+
+                // Determine affected frames (union of all windows)
+                const affected = new Set();
+                for (const editFrame of manualEdits) {
+                    for (let d = 1; d <= PROPAGATE_WINDOW; d++) {
+                        if (editFrame + d < this.totalFrames) affected.add(editFrame + d);
+                        if (editFrame - d >= 0) affected.add(editFrame - d);
+                    }
+                }
+                // Remove manual edit frames from affected
+                for (const ef of manualEdits) affected.delete(ef);
+
+                if (affected.size === 0) { this._propagating = false; return; }
+
+                // Show progress bar for propagation + preview cache rebuild
+                // Total: loading diffs + warp/upload per frame + cache reload per uploaded frame
+                let totalSteps = manualEdits.length + affected.size;
+                let pendingCacheRebuilds = 0;
+                let doneSteps = 0;
+                const updateProgress = () => {
+                    if (this.progressBar && this.progressFill) {
+                        this.progressBar.style.display = "block";
+                        this.progressFill.style.width = Math.round(doneSteps / totalSteps * 100) + "%";
+                    }
+                };
+                updateProgress();
+
+                // Load original mask pixels for each manual edit frame
+                const editDiffs = []; // { frameIndex, diffPixels: Float32Array }
+                for (const editFrame of manualEdits) {
+                    const edited = this.editedMasks.get(editFrame);
+                    const original = this.frames[editFrame];
+                    const [editedPx, origPx] = await Promise.all([
+                        this._loadMaskPixels(edited),
+                        this._loadMaskPixels(original),
+                    ]);
+                    if (!editedPx || !origPx) continue;
+                    // diff in mask space (1.0 = foreground), with noise threshold
+                    const diff = new Float32Array(editedPx.length);
+                    for (let i = 0; i < diff.length; i++) {
+                        const d = editedPx[i] - origPx[i];
+                        diff[i] = Math.abs(d) < PROPAGATE_DIFF_THRESHOLD ? 0 : d;
+                    }
+                    editDiffs.push({ frameIndex: editFrame, diff, w: origPx.w, h: origPx.h });
+                    doneSteps++;
+                    updateProgress();
+                }
+
+                if (editDiffs.length === 0) { this._propagating = false; return; }
+
+                const maskW = editDiffs[0].w;
+                const maskH = editDiffs[0].h;
+
+                // For each affected frame, compute propagated mask
+                for (const targetFrame of affected) {
+                    const origPx = await this._loadMaskPixels(this.frames[targetFrame]);
+                    if (!origPx) continue;
+
+                    const positiveDiff = new Float32Array(maskW * maskH);
+                    const negativeDiff = new Float32Array(maskW * maskH);
+
+                    for (const { frameIndex: editFrame, diff } of editDiffs) {
+                        const distance = Math.abs(targetFrame - editFrame);
+                        if (distance > PROPAGATE_WINDOW) continue;
+
+                        const warped = this._warpDiffChain(diff, maskW, maskH, editFrame, targetFrame);
+                        if (!warped) continue;
+
+                        for (let i = 0; i < warped.length; i++) {
+                            if (warped[i] > 0) positiveDiff[i] = Math.max(positiveDiff[i], warped[i]);
+                            else if (warped[i] < 0) negativeDiff[i] = Math.min(negativeDiff[i], warped[i]);
+                        }
+                    }
+
+                    // final = clamp(original + positive + negative, 0, 1)
+                    const finalMask = new Float32Array(maskW * maskH);
+                    let posCount = 0, negCount = 0, changedCount = 0;
+                    for (let i = 0; i < finalMask.length; i++) {
+                        if (positiveDiff[i] > 0) posCount++;
+                        if (negativeDiff[i] < 0) negCount++;
+                        finalMask[i] = Math.max(0, Math.min(1,
+                            origPx[i] + positiveDiff[i] + negativeDiff[i]
+                        ));
+                        if (Math.abs(finalMask[i] - origPx[i]) > 0.01) changedCount++;
+                    }
+                    if (changedCount === 0) continue;
+
+                    // Upload as RGBA PNG (mask editor convention)
+                    const ref = await this._uploadPropagatedMask(finalMask, maskW, maskH, targetFrame);
+                    if (ref) {
+                        this.editedMasks.set(targetFrame, { ...ref, source: "propagated" });
+                        // Invalidate preview cache for this frame
+                        if (this._previewCache) {
+                            if (this._previewCache.main) this._previewCache.main[targetFrame] = null;
+                            if (this._previewCache.bw) this._previewCache.bw[targetFrame] = null;
+                            totalSteps++;
+                            pendingCacheRebuilds++;
+                            this._cacheFrame(targetFrame).then(() => {
+                                doneSteps++;
+                                pendingCacheRebuilds--;
+                                updateProgress();
+                                if (pendingCacheRebuilds === 0 && this.progressBar) {
+                                    setTimeout(() => { this.progressBar.style.display = "none"; }, 500);
+                                }
+                            });
+                        }
+                    }
+                    doneSteps++;
+                    updateProgress();
+                }
+
+                this._syncEditedMasks();
+                this._updateEditedIndicator();
+                this.updatePreview(this.currentFrame);
+
+                // If no cache rebuilds were queued, hide progress now
+                if (pendingCacheRebuilds === 0 && this.progressBar) {
+                    setTimeout(() => { this.progressBar.style.display = "none"; }, 500);
+                }
+            } finally {
+                this._propagating = false;
+            }
+        };
+
+        // Load mask pixels from a frame ref as Float32Array [0,1] (foreground=1)
+        // Uses non-premultiplied alpha to avoid precision loss on transparent pixels.
+        nodeType.prototype._loadMaskPixels = async function (frameRef) {
+            try {
+                // Load full RGBA (not channel=a) to get original alpha without server re-encoding
+                const url = viewURL(frameRef, null, this._cacheTs);
+                const resp = await fetch(url);
+                const blob = await resp.blob();
+                // createImageBitmap with premultiplyAlpha:"none" preserves exact alpha values
+                const bmp = await createImageBitmap(blob, { premultiplyAlpha: "none" });
+                const w = bmp.width;
+                const h = bmp.height;
+                const c = document.createElement("canvas");
+                c.width = w;
+                c.height = h;
+                const ctx = c.getContext("2d", { willReadFrequently: true });
+                ctx.drawImage(bmp, 0, 0);
+                const data = ctx.getImageData(0, 0, w, h).data;
+                bmp.close();
+                // Mask editor convention: alpha=0 → foreground, alpha=255 → background
+                const pixels = new Float32Array(w * h);
+                for (let i = 0; i < pixels.length; i++) {
+                    pixels[i] = 1.0 - data[i * 4 + 3] / 255.0;
+                }
+                pixels.w = w;
+                pixels.h = h;
+                return pixels;
+            } catch {
+                return null;
+            }
+        };
+
+        // Warp diff from editFrame to targetFrame by chaining per-frame flows.
+        // Returns warped diff Float32Array or null.
+        nodeType.prototype._warpDiffChain = function (diff, w, h, editFrame, targetFrame) {
+            if (!this._flowCache || !this._flowMeta) return null;
+
+            const flowH = this._flowMeta.flow_h;
+            const flowW = this._flowMeta.flow_w;
+            let current = diff;
+
+            const step = targetFrame > editFrame ? 1 : -1;
+            // Warp does backward lookup (dst→src), so directions are inverted:
+            // propagate forward (5→6): use bwd flow (frame 6 looks up frame 5)
+            // propagate backward (10→9): use fwd flow (frame 9 looks up frame 10)
+            const warpDir = step > 0 ? "bwd" : "fwd";
+
+            for (let f = editFrame; f !== targetFrame; f += step) {
+                const flowIdx = step > 0 ? f : f - 1;
+                const flow = this._flowCache[warpDir]?.[flowIdx];
+                if (!flow) return null;
+                current = this._warpDiff(current, w, h, flow, flowH, flowW);
+            }
+            return current;
+        };
+
+        // Warp a diff array using a single flow field {dx, dy}
+        nodeType.prototype._warpDiff = function (diff, w, h, flow, flowH, flowW) {
+            const result = new Float32Array(w * h);
+            const scaleX = flowW / w;
+            const scaleY = flowH / h;
+
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    // Map to flow coordinates
+                    const fx = x * scaleX;
+                    const fy = y * scaleY;
+                    const fi = Math.min(Math.floor(fy), flowH - 1) * flowW + Math.min(Math.floor(fx), flowW - 1);
+
+                    // Source position
+                    const sx = x + flow.dx[fi] / scaleX;
+                    const sy = y + flow.dy[fi] / scaleY;
+
+                    // Bilinear interpolation
+                    const sx0 = Math.floor(sx), sy0 = Math.floor(sy);
+                    const sx1 = sx0 + 1, sy1 = sy0 + 1;
+                    if (sx0 >= 0 && sx1 < w && sy0 >= 0 && sy1 < h) {
+                        const fx2 = sx - sx0, fy2 = sy - sy0;
+                        result[y * w + x] =
+                            diff[sy0 * w + sx0] * (1 - fx2) * (1 - fy2) +
+                            diff[sy0 * w + sx1] * fx2 * (1 - fy2) +
+                            diff[sy1 * w + sx0] * (1 - fx2) * fy2 +
+                            diff[sy1 * w + sx1] * fx2 * fy2;
+                    }
+                }
+            }
+            return result;
+        };
+
+        // Upload propagated mask as RGBA PNG (alpha only, RGB=0) to ComfyUI
+        nodeType.prototype._uploadPropagatedMask = async function (maskData, w, h, frameIndex) {
+            try {
+                const c = document.createElement("canvas");
+                c.width = w;
+                c.height = h;
+                const ctx = c.getContext("2d");
+                const imgData = ctx.createImageData(w, h);
+                for (let i = 0; i < maskData.length; i++) {
+                    imgData.data[i * 4 + 3] = Math.round((1 - maskData[i]) * 255);
+                }
+                ctx.putImageData(imgData, 0, 0);
+
+                const pngBlob = await new Promise(resolve => c.toBlob(resolve, "image/png"));
+                const filename = `propagated-mask-${frameIndex}-${performance.now()}.png`;
+                // Include original_ref so server combines original RGB + propagated alpha
+                const originalFrame = this.frames[frameIndex];
+                const originalRef = {
+                    filename: originalFrame.filename,
+                    subfolder: originalFrame.subfolder || "",
+                    type: originalFrame.type || "temp",
+                };
+                const formData = new FormData();
+                formData.append("image", pngBlob, filename);
+                formData.append("original_ref", JSON.stringify(originalRef));
+                formData.append("type", "input");
+                formData.append("subfolder", "clipspace");
+                await api.fetchApi("/upload/mask", { method: "POST", body: formData });
+                return { filename, subfolder: "clipspace", type: "input" };
+            } catch (err) {
+                console.error("[PreviewSlider] Failed to upload propagated mask:", err);
+                return null;
+            }
         };
     },
 });
