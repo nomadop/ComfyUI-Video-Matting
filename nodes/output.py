@@ -271,6 +271,13 @@ class PreviewSlider:
         except (json.JSONDecodeError, TypeError):
             pass
 
+        # Detect input source change via fingerprint — clear stale edits
+        from .alpha_ops import _input_fingerprint
+        fp = _input_fingerprint(images=images, mask=mask)
+        if fp != getattr(self, '_last_input_fp', None):
+            edited = {}
+        self._last_input_fp = fp
+
         result_mask = []
         for i in range(B):
             if str(i) in edited:
@@ -314,6 +321,7 @@ class PreviewSlider:
                 "frames": frames,
                 "has_images": [has_images],
                 "has_mask": [has_mask],
+                "input_fingerprint": [fp],
             },
             "result": (mask_tensor,),
         }

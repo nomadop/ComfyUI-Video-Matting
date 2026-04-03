@@ -18,6 +18,25 @@ import comfy.utils
 import folder_paths
 
 
+def _input_fingerprint(**tensors):
+    """Multi-input fingerprint: name + shape + first-frame partial hash."""
+    import hashlib
+    parts = []
+    for name in sorted(tensors):
+        t = tensors[name]
+        if t is None:
+            continue
+        if isinstance(t, dict):  # OPTICAL_FLOW
+            fwd = t.get("fwd")
+            if fwd is not None:
+                parts.append(f"{name}:{fwd.shape[0]}")
+            continue
+        b = t[0].cpu().contiguous().numpy().tobytes()[:256]
+        h = hashlib.md5(b).hexdigest()[:12]
+        parts.append(f"{name}:{t.shape[0]}x{t.shape[1]}x{t.shape[2]}_{h}")
+    return "_".join(parts) or "empty"
+
+
 class MaskToGrayscaleImage:
     """Convert MASK [B,H,W] to grayscale IMAGE [B,H,W,3]
 
@@ -257,6 +276,13 @@ class AlphaCurveBlend:
                     f"alpha_{src_id} has {tensor.shape[0]} frames, "
                     f"expected {B} (same as alpha_a)"
                 )
+
+        # Detect input source change — reset stale curves to flat defaults
+        fp = _input_fingerprint(a=alpha_a, b=alpha_b, c=alpha_c, flow=optical_flow)
+        if fp != getattr(self, '_last_input_fp', None):
+            curve_data = self.DEFAULT_CURVE_DATA
+        self._last_input_fp = fp
+
         curves, mode = self._parse_curves(curve_data, sources)
 
         # Save source frames as temp PNGs for frontend preview
@@ -293,6 +319,7 @@ class AlphaCurveBlend:
         ui_data = {
             "source_frames": [source_frames],
             "total_frames": [B],
+            "input_fingerprint": [fp],
         }
 
         # Encode optical flow to PNG temp files for frontend

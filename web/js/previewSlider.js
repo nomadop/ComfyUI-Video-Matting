@@ -3,13 +3,14 @@ import { api } from "../../../scripts/api.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-function viewURL(frame, channel) {
+function viewURL(frame, channel, cacheTs) {
     const params = new URLSearchParams({
         filename: frame.filename,
         subfolder: frame.subfolder || "",
         type: frame.type || "temp",
     });
     if (channel) params.set("channel", channel);
+    if (cacheTs) params.set("_t", cacheTs);
     return api.apiURL(`/view?${params.toString()}`);
 }
 
@@ -43,6 +44,8 @@ app.registerExtension({
             this.editedMasks = new Map(); // frameIndex → {filename, subfolder, type}
             this._renderGen = 0; // generation counter to discard stale renders
             this._showMaskBW = false; // toggle: overlay vs B&W mask
+            this._cacheTs = "0";
+            this._lastFingerprint = null;
 
             // Prevent LiteGraph from rendering built-in image preview
             // (we have our own canvas preview). This stops node.imgs from
@@ -219,6 +222,22 @@ app.registerExtension({
             onExecuted?.apply(this, arguments);
 
             if (message?.frames && message.frames.length > 0) {
+                // Fingerprint-based input change detection
+                const fp = message.input_fingerprint?.[0];
+                if (fp) {
+                    this._cacheTs = fp;
+                    if (this._lastFingerprint !== null && this._lastFingerprint !== fp) {
+                        // Input changed — clear stale edits and caches
+                        this._previewCache = null;
+                        if (this.editedMasks.size > 0) {
+                            this.editedMasks.clear();
+                            this._syncEditedMasks();
+                            this._updateEditedIndicator();
+                        }
+                    }
+                    this._lastFingerprint = fp;
+                }
+
                 this.frames = message.frames;
                 this.totalFrames = message.frames.length;
                 this.hasImages = message.has_images?.[0] ?? false;
@@ -275,7 +294,7 @@ app.registerExtension({
 
         // ── _renderSimple: draw single channel to canvas ───────────────────
         nodeType.prototype._renderSimple = function (frame, channel, gen) {
-            const url = viewURL(frame, channel);
+            const url = viewURL(frame, channel, this._cacheTs);
             loadImage(url).then(img => {
                 if (gen === this._renderGen) this._drawToCanvas(img);
             }).catch(() => {});
@@ -283,7 +302,7 @@ app.registerExtension({
 
         // ── _renderMaskOnly: show alpha channel as grayscale ───────────────
         nodeType.prototype._renderMaskOnly = function (frame, gen) {
-            const url = viewURL(frame, "a");
+            const url = viewURL(frame, "a", this._cacheTs);
             loadImage(url).then(img => {
                 if (gen !== this._renderGen) return;
                 const tmp = document.createElement("canvas");
@@ -310,8 +329,8 @@ app.registerExtension({
         nodeType.prototype._renderOverlay = function (frame, isEdited, gen) {
             // For edited frames, the file itself is RGBA (from mask editor save)
             // For original frames with mask, the backend saved RGBA
-            const rgbURL = viewURL(frame, "rgb");
-            const alphaURL = viewURL(frame, "a");
+            const rgbURL = viewURL(frame, "rgb", this._cacheTs);
+            const alphaURL = viewURL(frame, "a", this._cacheTs);
 
             Promise.all([loadImage(rgbURL), loadImage(alphaURL)]).then(([rgbImg, aImg]) => {
                 if (gen !== this._renderGen) return;
@@ -400,8 +419,8 @@ app.registerExtension({
 
             if (needsOverlay) {
                 // Cache both modes: overlay (main) and B&W mask (bw)
-                const rgbURL = viewURL(frame, "rgb");
-                const alphaURL = viewURL(frame, "a");
+                const rgbURL = viewURL(frame, "rgb", this._cacheTs);
+                const alphaURL = viewURL(frame, "a", this._cacheTs);
 
                 Promise.all([loadImage(rgbURL), loadImage(alphaURL)]).then(([rgbImg, aImg]) => {
                     const w = rgbImg.naturalWidth;
@@ -456,7 +475,7 @@ app.registerExtension({
                 }).catch(() => {});
             } else if (this.hasImages) {
                 // Simple RGB
-                loadImage(viewURL(frame, "rgb")).then(img => {
+                loadImage(viewURL(frame, "rgb", this._cacheTs)).then(img => {
                     const c = document.createElement("canvas");
                     c.width = img.naturalWidth;
                     c.height = img.naturalHeight;
@@ -467,7 +486,7 @@ app.registerExtension({
                 }).catch(() => {});
             } else {
                 // Mask only (no RGB)
-                loadImage(viewURL(frame, "a")).then(img => {
+                loadImage(viewURL(frame, "a", this._cacheTs)).then(img => {
                     const w = img.naturalWidth;
                     const h = img.naturalHeight;
                     const c = document.createElement("canvas");
@@ -503,7 +522,7 @@ app.registerExtension({
                 ? this.editedMasks.get(editFrame)
                 : this.frames[editFrame];
 
-            loadImage(viewURL(source)).then(img => {
+            loadImage(viewURL(source, null, this._cacheTs)).then(img => {
                 // Clean up any existing property trap from a previous edit
                 if (Object.getOwnPropertyDescriptor(this, "images")?.set) {
                     delete this.images;

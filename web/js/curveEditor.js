@@ -249,6 +249,11 @@ app.registerExtension({
             this._flowCache = null;   // { fwd: [{dx,dy},...], bwd: [{dx,dy},...] }
             this._flowMeta = null;    // { flow_h, flow_w }
 
+            // Input change detection + async race prevention
+            this._generation = 0;
+            this._cacheTs = "0";
+            this._lastFingerprint = null;
+
             // ── DOM structure ────────────────────────────────────
             const container = document.createElement("div");
             container.style.cssText = `
@@ -465,6 +470,26 @@ app.registerExtension({
             const sourceFrames = message?.source_frames?.[0];
             const totalFrames = message?.total_frames?.[0];
             if (sourceFrames) {
+                // Bump generation to discard stale async callbacks
+                this._generation++;
+                const gen = this._generation;
+
+                // Fingerprint-based input change detection
+                const fp = message.input_fingerprint?.[0];
+                if (fp) {
+                    this._cacheTs = fp;
+                    if (this._lastFingerprint !== null && this._lastFingerprint !== fp) {
+                        // Input changed — reset user edits and caches
+                        for (const curve of this.curves) {
+                            curve.anchors = [[0, 1], [1, 1]];
+                        }
+                        this._blendCache = null;
+                        this._syncCurveData();
+                        this._rebuildLegend();
+                    }
+                    this._lastFingerprint = fp;
+                }
+
                 this.totalFrames = totalFrames || 0;
                 this.currentFrame = 0;
                 this.frameSlider.max = Math.max(0, this.totalFrames - 1);
@@ -472,7 +497,7 @@ app.registerExtension({
                 this.frameInput.max = Math.max(0, this.totalFrames - 1);
                 this.frameInput.value = 0;
                 this.frameLabel.textContent = `/ ${Math.max(0, this.totalFrames - 1)}`;
-                this._preloadFrames(sourceFrames);
+                this._preloadFrames(sourceFrames, gen);
 
                 // Load optical flow data if present
                 const flowData = message?.optical_flow?.[0];
@@ -481,13 +506,13 @@ app.registerExtension({
                         flow_h: flowData.flow_h,
                         flow_w: flowData.flow_w,
                     };
-                    this._preloadFlow(flowData);
+                    this._preloadFlow(flowData, gen);
                 } else {
                     this._flowCache = null;
                     this._flowMeta = null;
                 }
 
-                this._buildPixelCache();
+                this._buildPixelCache(gen);
             }
         };
 
@@ -518,17 +543,18 @@ app.registerExtension({
 
         // ── Methods ─────────────────────────────────────────────
 
-        nodeType.prototype._preloadFrames = function (sourceFrames) {
+        nodeType.prototype._preloadFrames = function (sourceFrames, gen) {
             this.frameCache = {};
             let firstLoaded = false;
             for (const [id, frames] of Object.entries(sourceFrames)) {
                 this.frameCache[id] = frames.map((f, idx) => {
                     const img = new Image();
                     img.crossOrigin = "anonymous";
-                    img.src = api.apiURL(`/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || "")}&type=${f.type || "temp"}`);
+                    img.src = api.apiURL(`/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || "")}&type=${f.type || "temp"}&_t=${encodeURIComponent(this._cacheTs)}`);
                     if (idx === 0 && !firstLoaded) {
                         firstLoaded = true;
                         img.onload = () => {
+                            if (this._generation !== gen) return;
                             this.previewSize = { w: img.naturalWidth, h: img.naturalHeight };
                             this.tmpCanvas.width = img.naturalWidth;
                             this.tmpCanvas.height = img.naturalHeight;
@@ -1163,7 +1189,7 @@ app.registerExtension({
 
         // ── Attention waveform ───────────────────────────────────
 
-        nodeType.prototype._preloadFlow = function (flowData) {
+        nodeType.prototype._preloadFlow = function (flowData, gen) {
             this._flowCache = null;
             const fwdList = flowData.fwd || [];
             const bwdList = flowData.bwd || [];
@@ -1194,10 +1220,12 @@ app.registerExtension({
             const onReady = () => {
                 pending++;
                 if (pending < total) return;
+                if (this._generation !== gen) return;
                 this._flowCache = cache;
             };
 
             const processFlowImg = (img, direction, idx) => {
+                if (this._generation !== gen) return;
                 // Draw at flow resolution
                 ctx.clearRect(0, 0, flowW, flowH);
                 ctx.drawImage(img, 0, 0, flowW, flowH);
@@ -1225,12 +1253,12 @@ app.registerExtension({
                     img.crossOrigin = "anonymous";
                     const dir = direction, idx = i;
                     img.onload = () => processFlowImg(img, dir, idx);
-                    img.src = api.apiURL(`/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || "")}&type=${f.type || "temp"}`);
+                    img.src = api.apiURL(`/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || "")}&type=${f.type || "temp"}&_t=${encodeURIComponent(this._cacheTs)}`);
                 }
             }
         };
 
-        nodeType.prototype._buildPixelCache = function () {
+        nodeType.prototype._buildPixelCache = function (gen) {
             this._pixelCache = null;
             this._divergenceScores = null;
             this._attentionDiv = null;
@@ -1258,6 +1286,7 @@ app.registerExtension({
             const onFrameReady = () => {
                 pending++;
                 if (pending < total) return;
+                if (this._generation !== gen) return;
                 this._pixelCache = cache;
                 this._computeDivergence();
                 this._computeAttention();
@@ -1270,6 +1299,7 @@ app.registerExtension({
                 for (let i = 0; i < frames.length; i++) {
                     const img = frames[i];
                     const processFrame = () => {
+                        if (this._generation !== gen) return;
                         ctx.clearRect(0, 0, SIZE, SIZE);
                         ctx.drawImage(img, 0, 0, SIZE, SIZE);
                         const data = ctx.getImageData(0, 0, SIZE, SIZE).data;
